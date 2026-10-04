@@ -222,6 +222,8 @@ Return ONLY a valid JSON array of objects.
 
     errors_log = []
 
+    candidate_models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-pro", "gemini-2.5-flash"]
+
     # Method 1: Try modern google-genai SDK
     if genai_client:
         try:
@@ -234,19 +236,26 @@ Return ONLY a valid JSON array of objects.
                     break
                 time.sleep(3)
 
-            response = genai_client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=[uploaded, prompt]
-            )
-            data = clean_json_response(response.text)
-            grouped: Dict[str, List[Dict[str, Any]]] = {}
-            for item in data:
-                t = item.get("topic", "General Section").strip()
-                if t not in grouped:
-                    grouped[t] = []
-                grouped[t].append(item)
-            if grouped:
-                return grouped, ""
+            for m_name in candidate_models:
+                try:
+                    logger.info(f"Attempting generation with model: {m_name}")
+                    response = genai_client.models.generate_content(
+                        model=m_name,
+                        contents=[uploaded, prompt]
+                    )
+                    data = clean_json_response(response.text)
+                    grouped: Dict[str, List[Dict[str, Any]]] = {}
+                    for item in data:
+                        t = item.get("topic", "General Section").strip()
+                        if t not in grouped:
+                            grouped[t] = []
+                        grouped[t].append(item)
+                    if grouped:
+                        return grouped, ""
+                except Exception as m_err:
+                    logger.warning(f"Model {m_name} failed: {m_err}")
+                    errors_log.append(f"Model {m_name}: {m_err}")
+
         except Exception as e:
             logger.warning(f"Modern genai error: {e}")
             errors_log.append(f"Modern SDK: {e}")
@@ -290,26 +299,30 @@ Return ONLY a valid JSON array of objects.
 
         if raw_text.strip():
             fallback_prompt = prompt + f"\n\nContent:\n{raw_text}"
-            if genai_client:
-                resp = genai_client.models.generate_content(
-                    model="gemini-1.5-flash",
-                    contents=fallback_prompt
-                )
-            elif legacy_model:
-                resp = legacy_model.generate_content(fallback_prompt)
-            else:
-                resp = None
+            for m_name in candidate_models:
+                try:
+                    if genai_client:
+                        resp = genai_client.models.generate_content(
+                            model=m_name,
+                            contents=fallback_prompt
+                        )
+                    elif legacy_model:
+                        resp = legacy_model.generate_content(fallback_prompt)
+                    else:
+                        resp = None
 
-            if resp:
-                data = clean_json_response(resp.text)
-                grouped = {}
-                for item in data:
-                    t = item.get("topic", "General Section").strip()
-                    if t not in grouped:
-                        grouped[t] = []
-                    grouped[t].append(item)
-                if grouped:
-                    return grouped, ""
+                    if resp:
+                        data = clean_json_response(resp.text)
+                        grouped = {}
+                        for item in data:
+                            t = item.get("topic", "General Section").strip()
+                            if t not in grouped:
+                                grouped[t] = []
+                            grouped[t].append(item)
+                        if grouped:
+                            return grouped, ""
+                except Exception as fb_m_err:
+                    logger.warning(f"Fallback model {m_name} failed: {fb_m_err}")
     except Exception as e:
         logger.error(f"Fallback extraction error: {e}")
         errors_log.append(f"Text Fallback: {e}")
