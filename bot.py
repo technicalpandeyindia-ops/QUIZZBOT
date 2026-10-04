@@ -852,6 +852,22 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+UP_SUPERTET_SUBJECTS: Dict[str, str] = {
+    "cdp": "बाल विकास एवं मनोविज्ञान (CDP)",
+    "teach": "शिक्षण कौशल एवं शिक्षण विधियाँ",
+    "life": "जीवन कौशल, प्रबंधन एवं अभिवृत्ति",
+    "hindi": "हिंदी भाषा एवं व्याकरण",
+    "evs": "पर्यावरण एवं सामाजिक अध्ययन (EVS & SST)",
+    "sci": "दैनिक जीवन में विज्ञान (General Science)",
+    "gk": "समसामयिक घटनाएं एवं सामान्य ज्ञान (GK & Current Affairs)",
+    "math": "गणित एवं तार्किक ज्ञान (Mathematics & Reasoning)",
+    "eng": "English Language & Comprehension",
+    "sanskrit": "संस्कृत भाषा एवं व्याकरण",
+    "it": "सूचना तकनीकी (Information Technology / Computer)",
+    "up_gk": "भारतीय संविधान, शासन व्यवस्था एवं UP Special GK"
+}
+
+
 async def handle_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -864,28 +880,28 @@ async def handle_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         
         subject_buttons = [
             [
-                InlineKeyboardButton("👶 बाल विकास (CDP - 10M)", callback_data="sub_sel:UP Super TET - बाल विकास"),
-                InlineKeyboardButton("📖 शिक्षण कौशल (10M)", callback_data="sub_sel:UP Super TET - शिक्षण कौशल")
+                InlineKeyboardButton("👶 बाल विकास (CDP - 10M)", callback_data="sub_sel:cdp"),
+                InlineKeyboardButton("📖 शिक्षण कौशल (10M)", callback_data="sub_sel:teach")
             ],
             [
-                InlineKeyboardButton("⚖️ जीवन कौशल एवं प्रबंधन (10M)", callback_data="sub_sel:UP Super TET - जीवन कौशल एवं प्रबंधन"),
-                InlineKeyboardButton("✍️ हिंदी भाषा एवं व्याकरण (20M)", callback_data="sub_sel:UP Super TET - हिंदी भाषा एवं व्याकरण")
+                InlineKeyboardButton("⚖️ जीवन कौशल (10M)", callback_data="sub_sel:life"),
+                InlineKeyboardButton("✍️ हिंदी भाषा (20M)", callback_data="sub_sel:hindi")
             ],
             [
-                InlineKeyboardButton("🌍 पर्यावरण एवं सामाजिक अध्ययन (10M)", callback_data="sub_sel:UP Super TET - पर्यावरण एवं सामाजिक अध्ययन EVS"),
-                InlineKeyboardButton("🔬 दैनिक जीवन में विज्ञान (10M)", callback_data="sub_sel:UP Super TET - सामान्य विज्ञान")
+                InlineKeyboardButton("🌍 EVS / सामाजिक अध्ययन (10M)", callback_data="sub_sel:evs"),
+                InlineKeyboardButton("🔬 विज्ञान (10M)", callback_data="sub_sel:sci")
             ],
             [
-                InlineKeyboardButton("📰 GK & Current Affairs (30M)", callback_data="sub_sel:UP Super TET - समसामयिक घटनाएं एवं सामान्य ज्ञान"),
-                InlineKeyboardButton("📐 गणित एवं तार्किक ज्ञान (25M)", callback_data="sub_sel:UP Super TET - गणित एवं रीजनिंग")
+                InlineKeyboardButton("📰 GK & Current Affairs (30M)", callback_data="sub_sel:gk"),
+                InlineKeyboardButton("📐 गणित एवं रीजनिंग (25M)", callback_data="sub_sel:math")
             ],
             [
-                InlineKeyboardButton("🔤 English Grammar (10M)", callback_data="sub_sel:UP Super TET - English Language & Grammar"),
-                InlineKeyboardButton("📜 संस्कृत भाषा एवं साहित्य (10M)", callback_data="sub_sel:UP Super TET - संस्कृत भाषा एवं व्याकरण")
+                InlineKeyboardButton("🔤 English Grammar (10M)", callback_data="sub_sel:eng"),
+                InlineKeyboardButton("📜 संस्कृत भाषा (10M)", callback_data="sub_sel:sanskrit")
             ],
             [
-                InlineKeyboardButton("💻 सूचना तकनीकी / Computer (5M)", callback_data="sub_sel:UP Super TET - सूचना तकनीकी Information Technology"),
-                InlineKeyboardButton("🏛️ भारतीय संविधान एवं UP GK", callback_data="sub_sel:UP Super TET - भारतीय संविधान एवं उत्तर प्रदेश विशेष")
+                InlineKeyboardButton("💻 सूचना तकनीकी / IT (5M)", callback_data="sub_sel:it"),
+                InlineKeyboardButton("🏛️ संविधान व UP GK", callback_data="sub_sel:up_gk")
             ]
         ]
 
@@ -989,7 +1005,8 @@ async def handle_subject_button_selection(update: Update, context: ContextTypes.
     data = query.data
 
     if data.startswith("sub_sel:"):
-        subject_name = data.split("sub_sel:")[1]
+        key = data.split("sub_sel:")[1]
+        subject_name = UP_SUPERTET_SUBJECTS.get(key, key)
         ADMIN_STATE[user_id] = {
             "custom_topic": subject_name,
             "step": "AWAITING_QUESTION_COUNT"
