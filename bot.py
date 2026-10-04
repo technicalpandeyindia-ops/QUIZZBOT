@@ -187,6 +187,54 @@ def download_large_file(url: str, output_path: str) -> bool:
     return os.path.exists(output_path) and os.path.getsize(output_path) > 10000
 
 
+# ----------------- YOUTUBE TRANSCRIPT & CONTENT EXTRACTOR -----------------
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+    HAS_YT_API = True
+except ImportError:
+    HAS_YT_API = False
+
+
+def extract_youtube_video_id(url: str) -> str:
+    match = re.search(r"(?:v=|\/live\/|\/shorts\/|youtu\.be\/|\/embed\/)([a-zA-Z0-9_-]{11})", url)
+    return match.group(1) if match else ""
+
+
+def get_youtube_video_content(url: str) -> Tuple[str, str, str]:
+    """Extracts YouTube video title and transcript/captions."""
+    video_id = extract_youtube_video_id(url)
+    if not video_id:
+        return "", "", "Invalid YouTube URL. Please provide a valid YouTube video, live stream, or marathon link."
+
+    title = f"YouTube Video ({video_id})"
+    try:
+        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        res = requests.get(oembed_url, timeout=10)
+        if res.status_code == 200:
+            title = res.json().get("title", title)
+    except Exception as e:
+        logger.warning(f"oEmbed fetch error: {e}")
+
+    transcript_text = ""
+    if HAS_YT_API:
+        try:
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['hi', 'en', 'hi-IN', 'en-IN'])
+            transcript_text = " ".join([item['text'] for item in transcript_list])
+        except Exception as yt_err:
+            logger.warning(f"YouTubeTranscriptApi standard error: {yt_err}")
+            try:
+                transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+                for t in transcripts:
+                    t_data = t.fetch()
+                    transcript_text = " ".join([item['text'] for item in t_data])
+                    if transcript_text:
+                        break
+            except Exception as e:
+                logger.warning(f"Auto-transcript fetch error: {e}")
+
+    return title, transcript_text, ""
+
+
 def clean_json_response(raw_text: str) -> List[Dict[str, Any]]:
     text = raw_text.strip()
     if text.startswith("```json"):
@@ -265,18 +313,24 @@ def generate_questions_with_gemini(file_path: str) -> Tuple[Dict[str, List[Dict[
         return {}, "GEMINI_API_KEY is not configured in Render environment."
 
     prompt = """
-You are an advanced competitive exam question designer. Analyze this document completely.
-Generate between 25 to 50 comprehensive Multiple Choice Questions for each topic.
+You are an advanced competitive exam question designer for UP Super TET, CTET, UPTET, and state teaching examinations.
+Analyze this document completely.
+
+CRITICAL INSTRUCTIONS & AUTHORITATIVE SOURCES:
+1. Align questions with top YouTube Marathon sessions (Ashriti Institute @ASHRITIINSTITUTE, Edumantra Institute @EdumantraInstitute, Sachin Academy Mega Marathon, Himanshi Singh Let's Learn, Chandra Institute Allahabad, RWA Rojgar with Ankit, Utkarsh Classes, Exampur Teaching School, Testbook/Adda247) and leading coaching books (Youth Competition Times YCT Solved Papers, Ghatna Chakra पूर्वावलोकन, SCERT/NCERT, Kiran Publication, Drishti IAS, Arihant).
+2. Generate between 25 to 50 comprehensive, high-yield Multiple Choice Questions for each topic.
+3. RANDOMIZE CORRECT ANSWER POSITION: Distribute correct answers evenly across index 0 (A), 1 (B), 2 (C), and 3 (D).
 
 For each question provide:
 - "topic": Topic / Chapter Name
 - "difficulty": "EASY" | "MEDIUM" | "HARD"
 - "question": High quality question text (max 280 chars)
 - "options": Exactly 4 options ["A", "B", "C", "D"] (each max 90 chars)
-- "correct_index": Integer (0, 1, 2, 3)
+- "correct_index": Integer (0 for A, 1 for B, 2 for C, 3 for D) — randomly vary this!
 - "concept": Core fact or theoretical principle
-- "solution": Step-by-step explanation
+- "solution": In-depth step-by-step pedagogical explanation
 - "pro_tip": Quick memory tip or key takeaway (max 180 chars)
+- "source_ref": Authentic Reference (e.g. "Ashriti Institute Marathon & YCT Solved Papers", "Edumantra Institute / SCERT", "Ghatna Chakra पूर्वावलोकन & Sachin Academy", "Chandra Institute Allahabad PYQ", "RWA Super TET Series")
 
 Return ONLY a valid JSON array of objects.
 """
@@ -410,28 +464,39 @@ Return ONLY a valid JSON array of objects.
 def generate_topic_batch(topic_name: str, batch_count: int, offset: int) -> Tuple[List[Dict[str, Any]], str]:
     global PRIMARY_WORKING_MODEL
     prompt = f"""
-You are an expert exam creator for UP Super TET and competitive exams.
+You are an elite competitive exam specialist for UP Super TET (उत्तर प्रदेश सुपर टीईटी), CTET, UPTET, and state teacher recruitment exams.
 Topic: "{topic_name}"
 
-CRITICAL: Generate EXACTLY {batch_count} unique MCQs starting from #{offset + 1} in Hindi (or bilingual for English).
-- "question": Max 280 chars
-- "options": Exactly 4 options, each MAX 90 chars
-- "correct_index": Integer (0, 1, 2, 3)
-- "concept": Core rule
-- "solution": Pedagogical solution
-- "pro_tip": Key trick / rule (max 180 chars)
+CRITICAL INSTRUCTIONS & AUTHENTIC KNOWLEDGE SOURCES:
+1. Synthesize questions aligned with top YouTube Marathon sessions:
+   - Ashriti Institute (@ASHRITIINSTITUTE)
+   - Edumantra Institute (@EdumantraInstitute)
+   - Sachin Academy Mega Marathon (Sachin Chaudhary Sir)
+   - Let's Learn (Himanshi Singh)
+   - Chandra Institute Allahabad (Dinesh Sir / Chandra Team)
+   - Rojgar with Ankit (RWA - Ankit Bhati Sir)
+   - Utkarsh Classes (Kumar Gaurav Sir / Shikshak Team)
+   - Exampur Teaching School (Vivek Sir)
+   - Testbook SuperCoaching & Adda247 Teaching
+2. Incorporate standard questions and trends from authoritative coaching publications:
+   - Youth Competition Times (YCT) Chapterwise Solved Papers & Practice Sets
+   - Ghatna Chakra पूर्वावलोकन (Purvavlokan)
+   - NCERT & UP Basic Shiksha Parishad (SCERT) Textbooks (Classes 1-10)
+   - Kiran Publication Teacher Recruitment Series
+   - Drishti IAS / Drishti Shikshak Bharti Study Material
+   - Arihant Master Guide & Solved Workbooks
+3. Generate EXACTLY {batch_count} unique MCQs starting from #{offset + 1} in Hindi (or bilingual for English).
+4. RANDOMIZE CORRECT ANSWER POSITION: Distribute correct answers evenly across index 0 (A), 1 (B), 2 (C), and 3 (D). Do NOT put the correct answer at index 0 (A) every time!
+5. Format limits:
+   - "question": Max 280 chars
+   - "options": Exactly 4 distinct options, each MAX 90 chars
+   - "correct_index": Integer (0 for A, 1 for B, 2 for C, 3 for D) — randomly vary this!
+   - "concept": Core rule / theory
+   - "solution": In-depth pedagogical solution & explanation
+   - "pro_tip": Exam trick / memory mnemonic (max 180 chars)
+   - "source_ref": Specific Reference Tag (e.g. "Ashriti Institute Marathon & YCT Solved Papers", "Edumantra Institute / SCERT Notes", "Sachin Academy Mega Marathon / YCT", "Ghatna Chakra पूर्वावलोकन & RWA Series", "Chandra Institute Allahabad PYQ", "Drishti IAS & Utkarsh Classes")
 
-Return ONLY a valid JSON array of {batch_count} objects:
-[
-  {{
-    "question": "प्रश्न...",
-    "options": ["विकल्प A", "विकल्प B", "विकल्प C", "विकल्प D"],
-    "correct_index": 0,
-    "concept": "मुख्य नियम",
-    "solution": "विस्तृत व्याख्या",
-    "pro_tip": "याद रखने योग्य ट्रिक"
-  }}
-]
+Return ONLY a valid JSON array of {batch_count} objects.
 """
     candidate_models = get_available_gemini_models()
     err_msgs = []
@@ -489,7 +554,7 @@ def generate_custom_topic_mcqs(topic_name: str, count: int) -> Tuple[List[Dict[s
     # Fast single batch for small counts
     if count <= 25:
         data, err = generate_topic_batch(topic_name, count, 0)
-        return data, err
+        return shuffle_mcq_options(data), err
 
     # High-speed parallel generation for larger counts (25-100 questions)
     batch_size = 25
@@ -520,9 +585,240 @@ def generate_custom_topic_mcqs(topic_name: str, count: int) -> Tuple[List[Dict[s
                 last_err = str(ex)
 
     if all_mcqs:
-        return all_mcqs[:count], ""
+        return shuffle_mcq_options(all_mcqs[:count]), ""
 
     return [], last_err or "Could not synthesize questions for this topic. Verify API key and network."
+
+
+# ----------------- HIGH-SPEED YOUTUBE VIDEO QUESTION GENERATOR -----------------
+def generate_youtube_topic_batch(video_title: str, transcript_snippet: str, video_url: str, batch_count: int, offset: int) -> Tuple[List[Dict[str, Any]], str]:
+    global PRIMARY_WORKING_MODEL
+    prompt = f"""
+You are an expert exam question creator for UP Super TET and competitive teacher examinations.
+YouTube Class / Marathon Title: "{video_title}"
+Video URL: "{video_url}"
+
+Content / Transcript Excerpt from Video:
+\"\"\"{transcript_snippet[:15000]}\"\"\"
+
+CRITICAL INSTRUCTIONS:
+1. Synthesize EXACTLY {batch_count} unique, high-yield Multiple Choice Questions starting from #{offset + 1} based on the key concepts, pedagogy, facts, rules, and questions taught in this YouTube class / marathon in Hindi (or bilingual for English).
+2. Align with top exam patterns (UP Super TET, CTET, UPTET).
+3. RANDOMIZE CORRECT ANSWER POSITION: Distribute correct answers evenly across index 0 (A), 1 (B), 2 (C), and 3 (D).
+4. Format limits:
+   - "question": Max 280 chars
+   - "options": Exactly 4 distinct options, each MAX 90 chars
+   - "correct_index": Integer (0 for A, 1 for B, 2 for C, 3 for D) — randomly vary this!
+   - "concept": Core theoretical principle / rule
+   - "solution": In-depth pedagogical solution & explanation
+   - "pro_tip": Exam trick / memory mnemonic (max 180 chars)
+   - "source_ref": Reference tag (e.g. "{video_title[:35]} • YouTube Marathon")
+
+Return ONLY a valid JSON array of {batch_count} objects.
+"""
+    candidate_models = get_available_gemini_models()
+    err_msgs = []
+
+    if legacy_genai and GEMINI_API_KEY:
+        for m_name in candidate_models:
+            try:
+                mod = legacy_genai.GenerativeModel(m_name)
+                resp = mod.generate_content(prompt)
+                if resp and resp.text:
+                    data = clean_json_response(resp.text)
+                    if isinstance(data, list) and len(data) > 0:
+                        PRIMARY_WORKING_MODEL = m_name
+                        return data, ""
+            except Exception as e:
+                logger.warning(f"Legacy model {m_name} failed on YT: {e}")
+                err_msgs.append(f"Legacy {m_name}: {e}")
+
+    if genai_client:
+        for m_name in candidate_models:
+            try:
+                config = None
+                if HAS_NEW_GENAI:
+                    config = new_genai_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.3
+                    )
+                resp = genai_client.models.generate_content(
+                    model=m_name,
+                    contents=prompt,
+                    config=config
+                )
+                if resp and resp.text:
+                    data = clean_json_response(resp.text)
+                    if isinstance(data, list) and len(data) > 0:
+                        PRIMARY_WORKING_MODEL = m_name
+                        return data, ""
+            except Exception as e:
+                logger.warning(f"Modern model {m_name} failed on YT: {e}")
+                err_msgs.append(f"{m_name}: {e}")
+
+    last_error = "\n".join(err_msgs[-2:]) if err_msgs else "No compatible Gemini model found."
+    return [], last_error
+
+
+def generate_youtube_mcqs(video_title: str, transcript: str, video_url: str, count: int) -> Tuple[List[Dict[str, Any]], str]:
+    import concurrent.futures
+    if not GEMINI_API_KEY:
+        return [], "GEMINI_API_KEY is not configured in Render environment."
+
+    count = max(5, min(count, 100))
+
+    if count <= 25:
+        data, err = generate_youtube_topic_batch(video_title, transcript, video_url, count, 0)
+        return shuffle_mcq_options(data), err
+
+    batch_size = 25
+    tasks = []
+    offset = 0
+    remaining = count
+
+    while remaining > 0:
+        c_size = min(remaining, batch_size)
+        tasks.append((video_title, transcript, video_url, c_size, offset))
+        offset += c_size
+        remaining -= c_size
+
+    all_mcqs: List[Dict[str, Any]] = []
+    last_err = ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+        futures = [executor.submit(generate_youtube_topic_batch, t[0], t[1], t[2], t[3], t[4]) for t in tasks]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                batch_data, err = future.result()
+                if batch_data:
+                    all_mcqs.extend(batch_data)
+                elif err:
+                    last_err = err
+            except Exception as ex:
+                last_err = str(ex)
+
+    if all_mcqs:
+        return shuffle_mcq_options(all_mcqs[:count]), ""
+
+    return [], last_err or "Could not synthesize questions from YouTube video."
+
+
+# ----------------- HIGH-SPEED FULL MODEL PAPER / MOCK TEST GENERATOR -----------------
+def generate_model_paper_batch(paper_type: str, batch_count: int, offset: int) -> Tuple[List[Dict[str, Any]], str]:
+    global PRIMARY_WORKING_MODEL
+    prompt = f"""
+You are the Chief Examiner for UP Super TET (उत्तर प्रदेश सुपर टीईटी) official competitive recruitment examination.
+Task: Generate a Full Balanced Model Paper (मॉक टेस्ट / मॉडल पेपर).
+
+CRITICAL INSTRUCTIONS & EXAM PATTERN:
+1. Synthesize EXACTLY {batch_count} unique, high-yield Multiple Choice Questions starting from #{offset + 1} with balanced proportional representation across all UP Super TET sections:
+   - बाल विकास एवं शिक्षण शास्त्र (CDP & Pedagogy)
+   - हिंदी भाषा एवं व्याकरण (Hindi Grammar & Literature)
+   - English Language & Grammar
+   - संस्कृत भाषा एवं साहित्य (Sanskrit)
+   - गणित एवं तार्किक ज्ञान (Mathematics & Reasoning)
+   - पर्यावरण एवं सामाजिक अध्ययन (EVS & Social Studies)
+   - दैनिक जीवन में विज्ञान (General Science)
+   - समसामयिक घटनाएं एवं सामान्य ज्ञान (Current Affairs & GK)
+   - सूचना तकनीकी एवं जीवन कौशल (IT, Computer & Life Skills)
+2. Incorporate trends from top YouTube Marathons (Ashriti Institute, Edumantra Institute, Sachin Academy, Chandra Institute, RWA) and standard coaching books (YCT Solved Papers, Ghatna Chakra पूर्वावलोकन, SCERT/NCERT).
+3. RANDOMIZE CORRECT ANSWER POSITION: Distribute correct answers evenly across index 0 (A), 1 (B), 2 (C), and 3 (D).
+4. Format limits:
+   - "question": Max 280 chars
+   - "options": Exactly 4 distinct options, each MAX 90 chars
+   - "correct_index": Integer (0 for A, 1 for B, 2 for C, 3 for D) — randomly vary this!
+   - "concept": Core rule / theory
+   - "solution": In-depth pedagogical solution & explanation
+   - "pro_tip": Exam trick / memory mnemonic (max 180 chars)
+   - "source_ref": Reference Tag (e.g. "UP Super TET Model Paper • YCT & Ashriti Marathon", "UP Super TET Official Pattern • Ghatna Chakra / SCERT")
+
+Return ONLY a valid JSON array of {batch_count} objects.
+"""
+    candidate_models = get_available_gemini_models()
+    err_msgs = []
+
+    if legacy_genai and GEMINI_API_KEY:
+        for m_name in candidate_models:
+            try:
+                mod = legacy_genai.GenerativeModel(m_name)
+                resp = mod.generate_content(prompt)
+                if resp and resp.text:
+                    data = clean_json_response(resp.text)
+                    if isinstance(data, list) and len(data) > 0:
+                        PRIMARY_WORKING_MODEL = m_name
+                        return data, ""
+            except Exception as e:
+                logger.warning(f"Legacy model {m_name} failed on Model Paper: {e}")
+                err_msgs.append(f"Legacy {m_name}: {e}")
+
+    if genai_client:
+        for m_name in candidate_models:
+            try:
+                config = None
+                if HAS_NEW_GENAI:
+                    config = new_genai_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.3
+                    )
+                resp = genai_client.models.generate_content(
+                    model=m_name,
+                    contents=prompt,
+                    config=config
+                )
+                if resp and resp.text:
+                    data = clean_json_response(resp.text)
+                    if isinstance(data, list) and len(data) > 0:
+                        PRIMARY_WORKING_MODEL = m_name
+                        return data, ""
+            except Exception as e:
+                logger.warning(f"Modern model {m_name} failed on Model Paper: {e}")
+                err_msgs.append(f"{m_name}: {e}")
+
+    last_error = "\n".join(err_msgs[-2:]) if err_msgs else "No compatible Gemini model found."
+    return [], last_error
+
+
+def generate_full_model_paper_mcqs(count: int) -> Tuple[List[Dict[str, Any]], str]:
+    import concurrent.futures
+    if not GEMINI_API_KEY:
+        return [], "GEMINI_API_KEY is not configured in Render environment."
+
+    count = max(5, min(count, 100))
+
+    if count <= 25:
+        data, err = generate_model_paper_batch("UP Super TET Model Paper", count, 0)
+        return shuffle_mcq_options(data), err
+
+    batch_size = 25
+    tasks = []
+    offset = 0
+    remaining = count
+
+    while remaining > 0:
+        c_size = min(remaining, batch_size)
+        tasks.append(("UP Super TET Model Paper", c_size, offset))
+        offset += c_size
+        remaining -= c_size
+
+    all_mcqs: List[Dict[str, Any]] = []
+    last_err = ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+        futures = [executor.submit(generate_model_paper_batch, t[0], t[1], t[2]) for t in tasks]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                batch_data, err = future.result()
+                if batch_data:
+                    all_mcqs.extend(batch_data)
+                elif err:
+                    last_err = err
+            except Exception as ex:
+                last_err = str(ex)
+
+    if all_mcqs:
+        return shuffle_mcq_options(all_mcqs[:count]), ""
+
+    return [], last_err or "Could not synthesize Model Paper questions."
 
 
 # ----------------- ADMIN HANDLERS -----------------
@@ -538,15 +834,19 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     buttons = [
-        [InlineKeyboardButton("✍️ Create Quiz by Topic (No PDF Needed)", callback_data="mode_topic")],
-        [InlineKeyboardButton("📄 Upload PDF / Google Drive Link", callback_data="mode_pdf")]
+        [InlineKeyboardButton("✍️ 1️⃣ Create by Topic (No PDF Needed)", callback_data="mode_topic")],
+        [InlineKeyboardButton("📄 2️⃣ Upload PDF / Google Drive Link", callback_data="mode_pdf")],
+        [InlineKeyboardButton("🎥 3️⃣ Create from YouTube Video / Marathon URL", callback_data="mode_yt")],
+        [InlineKeyboardButton("🏆 4️⃣ Full Model Paper / Mock Test (मॉडल पेपर)", callback_data="mode_mock")]
     ]
 
     await update.message.reply_text(
         "⚡ *AI Exam & Quiz Master (UP Super TET & All Exams)*\n\n"
         "Choose how you want to create your quiz:\n\n"
-        "1️⃣ *Create by Topic (No PDF)*: Just give the topic name (e.g. `UP Super TET - Bal Vikas`), select question count (e.g. 25–50), and launch!\n"
-        "2️⃣ *PDF / Cloud Ingest*: Send any PDF or Google Drive link for full book parsing.",
+        "1️⃣ *Create by Topic*: Pick any UP Super TET subject or custom topic.\n"
+        "2️⃣ *PDF / Cloud Ingest*: Send any book PDF or Google Drive link.\n"
+        "3️⃣ *YouTube Video / Marathon*: Paste any YouTube video or marathon class link.\n"
+        "4️⃣ *Full Model Paper (मॉक टेस्ट)*: Launch a balanced full-syllabus simulation test!",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
@@ -561,20 +861,144 @@ async def handle_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if data == "mode_topic":
         ADMIN_STATE[user_id] = {"step": "AWAITING_TOPIC_NAME"}
+        
+        subject_buttons = [
+            [
+                InlineKeyboardButton("👶 बाल विकास (CDP - 10M)", callback_data="sub_sel:UP Super TET - बाल विकास"),
+                InlineKeyboardButton("📖 शिक्षण कौशल (10M)", callback_data="sub_sel:UP Super TET - शिक्षण कौशल")
+            ],
+            [
+                InlineKeyboardButton("⚖️ जीवन कौशल एवं प्रबंधन (10M)", callback_data="sub_sel:UP Super TET - जीवन कौशल एवं प्रबंधन"),
+                InlineKeyboardButton("✍️ हिंदी भाषा एवं व्याकरण (20M)", callback_data="sub_sel:UP Super TET - हिंदी भाषा एवं व्याकरण")
+            ],
+            [
+                InlineKeyboardButton("🌍 पर्यावरण एवं सामाजिक अध्ययन (10M)", callback_data="sub_sel:UP Super TET - पर्यावरण एवं सामाजिक अध्ययन EVS"),
+                InlineKeyboardButton("🔬 दैनिक जीवन में विज्ञान (10M)", callback_data="sub_sel:UP Super TET - सामान्य विज्ञान")
+            ],
+            [
+                InlineKeyboardButton("📰 GK & Current Affairs (30M)", callback_data="sub_sel:UP Super TET - समसामयिक घटनाएं एवं सामान्य ज्ञान"),
+                InlineKeyboardButton("📐 गणित एवं तार्किक ज्ञान (25M)", callback_data="sub_sel:UP Super TET - गणित एवं रीजनिंग")
+            ],
+            [
+                InlineKeyboardButton("🔤 English Grammar (10M)", callback_data="sub_sel:UP Super TET - English Language & Grammar"),
+                InlineKeyboardButton("📜 संस्कृत भाषा एवं साहित्य (10M)", callback_data="sub_sel:UP Super TET - संस्कृत भाषा एवं व्याकरण")
+            ],
+            [
+                InlineKeyboardButton("💻 सूचना तकनीकी / Computer (5M)", callback_data="sub_sel:UP Super TET - सूचना तकनीकी Information Technology"),
+                InlineKeyboardButton("🏛️ भारतीय संविधान एवं UP GK", callback_data="sub_sel:UP Super TET - भारतीय संविधान एवं उत्तर प्रदेश विशेष")
+            ]
+        ]
+
         await query.edit_message_text(
-            "✍️ *Step 1/3: Enter Topic or Subject Name*\n\n"
-            "Examples:\n"
-            "• `UP Super TET - बाल विकास एवं शिक्षण शास्त्र`\n"
-            "• `UP Super TET - हिंदी व्याकरण एवं साहित्य`\n"
-            "• `पर्यावरण एवं सामाजिक अध्ययन (EVS)`\n"
-            "• `Current Affairs 2026`\n\n"
-            "👉 *Type and send your topic name here:*",
+            "📚 *UP Super TET 150-Marks All Subject Matrix:*\n\n"
+            "👇 *Tap any subject below to generate instant exam quiz:*\n\n"
+            "1️⃣ `बाल विकास (CDP)` • 10 Marks\n"
+            "2️⃣ `शिक्षण कौशल (Teaching Methodology)` • 10 Marks\n"
+            "3️⃣ `जीवन कौशल, प्रबंधन एवं अभिवृत्ति` • 10 Marks\n"
+            "4️⃣ `हिंदी भाषा एवं व्याकरण` • 20 Marks\n"
+            "5️⃣ `English Language & Grammar` • 10 Marks\n"
+            "6️⃣ `संस्कृत भाषा एवं साहित्य` • 10 Marks\n"
+            "7️⃣ `गणित एवं रीजनिंग (Maths & Logic)` • 25 Marks\n"
+            "8️⃣ `पर्यावरण एवं सामाजिक अध्ययन (EVS & SST)` • 10 Marks\n"
+            "9️⃣ `दैनिक जीवन में विज्ञान (Science)` • 10 Marks\n"
+            "🔟 `समसामयिक घटनाएं एवं सामान्य ज्ञान (GK)` • 30 Marks\n"
+            "1️⃣1️⃣ `सूचना तकनीकी (IT / Computer)` • 5 Marks\n"
+            "1️⃣2️⃣ `भारतीय संविधान एवं UP Special GK`\n\n"
+            "👉 *Tap a button above or type any custom topic name in chat:*",
+            reply_markup=InlineKeyboardMarkup(subject_buttons),
             parse_mode="Markdown"
         )
     elif data == "mode_pdf":
         ADMIN_STATE[user_id] = {"step": "AWAITING_PDF"}
         await query.edit_message_text(
             "📄 *Send your PDF document or paste a Google Drive link right here in chat!*",
+            parse_mode="Markdown"
+        )
+    elif data == "mode_yt":
+        ADMIN_STATE[user_id] = {"step": "AWAITING_YT_URL"}
+        await query.edit_message_text(
+            "🎥 *Step 1/3: Send YouTube Video or Marathon URL*\n\n"
+            "Paste any YouTube video link, live marathon, or practice set:\n"
+            "• `https://www.youtube.com/watch?v=...`\n"
+            "• `https://youtu.be/...`\n"
+            "• `https://www.youtube.com/live/...`\n\n"
+            "👉 *Paste your YouTube link here in chat:*",
+            parse_mode="Markdown"
+        )
+    elif data == "mode_mock":
+        mock_buttons = [
+            [
+                InlineKeyboardButton("⚡ 25 Qs Mini Model Paper", callback_data="mock_len:25"),
+                InlineKeyboardButton("📊 50 Qs Standard Model Paper", callback_data="mock_len:50")
+            ],
+            [
+                InlineKeyboardButton("🔥 75 Qs Mega Model Paper", callback_data="mock_len:75"),
+                InlineKeyboardButton("👑 100 Qs Grand Model Paper", callback_data="mock_len:100")
+            ],
+            [
+                InlineKeyboardButton("✍️ Custom Question Count", callback_data="mock_len:custom")
+            ]
+        ]
+        await query.edit_message_text(
+            "🏆 *UP Super TET Full Model Paper / Mock Test (मॉक टेस्ट)*\n\n"
+            "Simulates the complete 150-mark balanced official exam pattern covering:\n"
+            "• CDP & Teaching Skills • Hindi • English • Sanskrit\n"
+            "• Maths & Reasoning • Science • EVS & SST • GK/Current Affairs • Life Skills & IT\n\n"
+            "👇 *Select question count for this Model Paper:*",
+            reply_markup=InlineKeyboardMarkup(mock_buttons),
+            parse_mode="Markdown"
+        )
+
+
+async def handle_mock_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    data = query.data
+    val = data.split("mock_len:")[1]
+
+    if val == "custom":
+        ADMIN_STATE[user_id] = {"step": "AWAITING_MOCK_COUNT"}
+        await query.edit_message_text(
+            "🔢 *Enter Custom Question Count for Model Paper:*\n"
+            "Examples: `15`, `30`, `45`, `60`, `90`\n\n"
+            "👉 *Send the number of questions in chat:*",
+            parse_mode="Markdown"
+        )
+    else:
+        q_count = int(val)
+        ADMIN_STATE[user_id] = {
+            "mock_q_count": q_count,
+            "step": "AWAITING_MOCK_GROUP"
+        }
+        await query.edit_message_text(
+            f"🏆 *Model Paper Selected:* `{q_count} Questions`\n\n"
+            f"📢 *Send target Group Username or ID:*\n"
+            f"Examples: `@myquizgroup` or `-1001234567890`\n\n"
+            f"*(Ensure bot is an Admin in the group)*",
+            parse_mode="Markdown"
+        )
+
+
+async def handle_subject_button_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    data = query.data
+
+    if data.startswith("sub_sel:"):
+        subject_name = data.split("sub_sel:")[1]
+        ADMIN_STATE[user_id] = {
+            "custom_topic": subject_name,
+            "step": "AWAITING_QUESTION_COUNT"
+        }
+        await query.edit_message_text(
+            f"🎯 *Selected Subject:* `{subject_name}`\n\n"
+            f"🔢 *Step 2/3: How many questions do you want to generate?*\n"
+            f"Examples: `10`, `25`, `30`, `50`, `75`\n\n"
+            f"👉 *Type and send the number of questions in chat:*",
             parse_mode="Markdown"
         )
 
@@ -633,6 +1057,172 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = ADMIN_STATE.get(user_id, {})
     text = update.message.text.strip()
     current_step = state.get("step")
+    is_yt_link = ("youtube.com" in text or "youtu.be" in text)
+
+    # Step: Admin providing YouTube URL
+    if current_step == "AWAITING_YT_URL" or (is_yt_link and (not current_step or current_step == "AWAITING_PDF")):
+        if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+            await update.message.reply_text("⛔ Unauthorized.")
+            return
+
+        status = await update.message.reply_text("⏳ *Step 1/3:* Fetching YouTube video & transcript...", parse_mode="Markdown")
+        loop = asyncio.get_running_loop()
+        title, transcript, err = await loop.run_in_executor(None, get_youtube_video_content, text)
+        if err:
+            await status.edit_text(f"❌ *YouTube Error:* `{err}`")
+            return
+
+        has_sub = "✅ Captions / Transcript Extracted" if transcript else "ℹ️ Topic & Concept Synthesis Mode"
+        state["yt_url"] = text
+        state["yt_title"] = title
+        state["yt_transcript"] = transcript
+        state["step"] = "AWAITING_YT_Q_COUNT"
+
+        await status.edit_text(
+            f"🎥 *YouTube Video Loaded:*\n`{title}`\n\n"
+            f"📝 *Transcript:* `{has_sub}`\n\n"
+            f"🔢 *Step 2/3: How many questions do you want to generate?*\n"
+            f"Examples: `10`, `25`, `30`, `50`, `75`\n\n"
+            f"👉 *Type and send the number of questions:*",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Step: Admin providing YouTube question count
+    if current_step == "AWAITING_YT_Q_COUNT":
+        if not text.isdigit() or int(text) < 1:
+            await update.message.reply_text("❌ Please enter a valid positive number (e.g. `25` or `50`):")
+            return
+
+        state["yt_q_count"] = int(text)
+        state["step"] = "AWAITING_YT_GROUP"
+        await update.message.reply_text(
+            f"📊 *Questions to Generate from Video:* `{state['yt_q_count']}`\n\n"
+            f"📢 *Step 3/3: Send target Group Username or ID:*\n"
+            f"Examples: `@myquizgroup` or `-1001234567890`\n\n"
+            f"*(Ensure bot is an Admin in the group)*",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Step: Admin providing group for YouTube quiz
+    if current_step == "AWAITING_YT_GROUP":
+        target_group = text
+        video_title = state.get("yt_title", "YouTube Class")
+        transcript = state.get("yt_transcript", "")
+        video_url = state.get("yt_url", "")
+        q_count = state.get("yt_q_count", 25)
+
+        status_msg = await update.message.reply_text(
+            f"🧠 Synthesizing `{q_count}` questions from *{video_title}* with Gemini AI...",
+            parse_mode="Markdown"
+        )
+
+        loop = asyncio.get_running_loop()
+        mcqs, err = await loop.run_in_executor(None, generate_youtube_mcqs, video_title, transcript, video_url, q_count)
+
+        if not mcqs:
+            await status_msg.edit_text(f"❌ *Synthesis Failed:* `{err}`\nTry running again with `/start`.")
+            return
+
+        try:
+            intro_card = (
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📋 *Exam Target:* `UP Super TET / Competitive`\n"
+                f"🎥 *YouTube Source:* `{video_title[:45]}`\n"
+                f"📊 *Questions:* `{len(mcqs)}`\n"
+                f"⏱️ *Timer:* `15s per question`\n"
+                f"✅ *Correct mark:* `+1.0`\n"
+                f"➖ *Negative:* `None`\n"
+                f"👥 *Voting:* `Open for ALL group members`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🚀 *Starting now — tap your answer on each poll!*"
+            )
+            await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
+            group_chat_id = (await context.bot.get_chat(target_group)).id
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Failed to reach `{target_group}`: `{e}`\nCheck bot admin permissions and try again.")
+            return
+
+        state["step"] = "LAUNCHED"
+        await status_msg.edit_text(f"🔥 *Quiz on `{video_title[:35]}` ({len(mcqs)} Qs) live in* `{target_group}`!", parse_mode="Markdown")
+
+        shuffled_mcqs = shuffle_mcq_options(mcqs)
+        ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
+            "mcqs": shuffled_mcqs,
+            "current_index": 0,
+            "topic": video_title[:40]
+        }
+
+        asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context))
+        return
+
+    # Step: Admin providing custom model paper question count
+    if current_step == "AWAITING_MOCK_COUNT":
+        if not text.isdigit() or int(text) < 1:
+            await update.message.reply_text("❌ Please enter a valid positive number of questions (e.g. `25`, `50`, `75`):")
+            return
+
+        count = int(text)
+        state["mock_q_count"] = count
+        state["step"] = "AWAITING_MOCK_GROUP"
+        await update.message.reply_text(
+            f"📊 *Full Model Paper Questions:* `{count}`\n\n"
+            f"📢 *Send target Group Username or ID:*\n"
+            f"Examples: `@myquizgroup` or `-1001234567890`\n\n"
+            f"*(Ensure bot is an Admin in the group)*",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Step: Admin providing group for full model paper quiz
+    if current_step == "AWAITING_MOCK_GROUP":
+        target_group = text
+        q_count = state.get("mock_q_count", 25)
+
+        status_msg = await update.message.reply_text(
+            f"🧠 Synthesizing `{q_count}` Full Model Paper questions across all 14 UP Super TET subjects with Gemini AI...",
+            parse_mode="Markdown"
+        )
+
+        loop = asyncio.get_running_loop()
+        mcqs, err = await loop.run_in_executor(None, generate_full_model_paper_mcqs, q_count)
+
+        if not mcqs:
+            await status_msg.edit_text(f"❌ *Synthesis Failed:* `{err}`\nTry running again with `/start`.")
+            return
+
+        try:
+            intro_card = (
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📋 *Exam Target:* `UP Super TET Full Model Paper (संपूर्ण मॉडल पेपर)`\n"
+                f"📚 *Coverage:* `All 14 Subjects (Hindi, Sanskrit, Eng, Sci, Math, EV, CDP, Teaching Skills, GK/CA, Reasoning, IT, Life Skills)`\n"
+                f"📊 *Questions:* `{len(mcqs)}`\n"
+                f"⏱️ *Timer:* `15s per question`\n"
+                f"✅ *Correct mark:* `+1.0`\n"
+                f"➖ *Negative:* `None`\n"
+                f"👥 *Voting:* `Open for ALL group members`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🚀 *Starting now — tap your answer on each poll!*"
+            )
+            await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
+            group_chat_id = (await context.bot.get_chat(target_group)).id
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Failed to reach `{target_group}`: `{e}`\nCheck bot admin permissions and try again.")
+            return
+
+        state["step"] = "LAUNCHED"
+        await status_msg.edit_text(f"🔥 *UP Super TET Full Model Paper ({len(mcqs)} Questions) live in* `{target_group}`!", parse_mode="Markdown")
+
+        shuffled_mcqs = shuffle_mcq_options(mcqs)
+        ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
+            "mcqs": shuffled_mcqs,
+            "current_index": 0,
+            "topic": "UP Super TET Full Model Paper"
+        }
+
+        asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context))
+        return
 
     # Step: Admin providing topic name
     if current_step == "AWAITING_TOPIC_NAME":
@@ -705,8 +1295,9 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["step"] = "LAUNCHED"
         await status_msg.edit_text(f"🔥 *Quiz on `{topic}` ({len(mcqs)} Questions) live in* `{target_group}`!", parse_mode="Markdown")
 
+        shuffled_mcqs = shuffle_mcq_options(mcqs)
         ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
-            "mcqs": mcqs,
+            "mcqs": shuffled_mcqs,
             "current_index": 0,
             "topic": topic
         }
@@ -871,8 +1462,9 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
     state["step"] = "LAUNCHED"
     await update.message.reply_text(f"🔥 *Quiz on `{topic}` ({len(mcqs)} Questions) initiated in* `{target_group}`!", parse_mode="Markdown")
 
+    shuffled_mcqs = shuffle_mcq_options(mcqs)
     ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
-        "mcqs": mcqs,
+        "mcqs": shuffled_mcqs,
         "current_index": 0,
         "topic": topic
     }
@@ -880,7 +1472,39 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
     asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context))
 
 
-# ----------------- TELEGRAM NATIVE QUIZ ENGINE (ALL-USER VOTING ENABLED) -----------------
+import random
+
+
+def shuffle_mcq_options(mcqs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Eliminates LLM positional bias (Option A) by uniformly randomizing option order."""
+    shuffled = []
+    for item in mcqs:
+        item_copy = dict(item)
+        raw_options = [str(opt).strip() for opt in item_copy.get("options", []) if str(opt).strip()]
+        if len(raw_options) < 2:
+            shuffled.append(item_copy)
+            continue
+
+        orig_idx = int(item_copy.get("correct_index", 0))
+        if orig_idx < 0 or orig_idx >= len(raw_options):
+            orig_idx = 0
+
+        correct_val = raw_options[orig_idx]
+        opts = list(raw_options)
+        random.shuffle(opts)
+        new_idx = opts.index(correct_val)
+
+        item_copy["options"] = opts
+        item_copy["correct_index"] = new_idx
+        shuffled.append(item_copy)
+    return shuffled
+
+
+# Global Poll Lookup for Live Vote Tracking
+POLL_LOOKUP: Dict[str, Dict[str, Any]] = {}
+
+
+# ----------------- TELEGRAM NATIVE QUIZ ENGINE (ALL-USER VOTING & RANKING) -----------------
 async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     chat_key = str(group_chat_id)
     session = ACTIVE_GROUP_QUIZZES.get(chat_key)
@@ -889,6 +1513,7 @@ async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEF
 
     mcqs = session["mcqs"]
     total_q = len(mcqs)
+    session["scores"] = {}
 
     for idx, item in enumerate(mcqs):
         session["current_index"] = idx
@@ -898,7 +1523,7 @@ async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEF
         if len(q_title) > 295:
             q_title = q_title[:292] + "..."
 
-        # Options (strictly max 98 characters per Telegram limit)
+        # Options (strictly max 95 characters per Telegram limit)
         raw_options = item.get("options", [])
         options = [str(opt).strip()[:95] for opt in raw_options if str(opt).strip()]
         if len(options) < 2:
@@ -916,7 +1541,7 @@ async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEF
 
         poll_msg = None
         try:
-            # is_anonymous=True allows 100% of group members to vote without any permissions or privacy blocks
+            # is_anonymous=False enables live voter tracking and leaderboard ranking
             poll_msg = await context.bot.send_poll(
                 chat_id=group_chat_id,
                 question=q_title,
@@ -924,12 +1549,16 @@ async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEF
                 type="quiz",
                 correct_option_id=correct_id,
                 explanation=explanation if explanation else None,
-                is_anonymous=True,
+                is_anonymous=False,
                 open_period=15  # 15s visual countdown ring
             )
+            if poll_msg and poll_msg.poll:
+                POLL_LOOKUP[poll_msg.poll.id] = {
+                    "chat_key": chat_key,
+                    "correct_id": correct_id
+                }
         except Exception as poll_err:
             logger.error(f"Poll dispatch error: {poll_err}")
-            # Fallback if explanation had disallowed formatting
             try:
                 poll_msg = await context.bot.send_poll(
                     chat_id=group_chat_id,
@@ -937,40 +1566,40 @@ async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEF
                     options=options,
                     type="quiz",
                     correct_option_id=correct_id,
-                    is_anonymous=True,
+                    is_anonymous=False,
                     open_period=15
                 )
+                if poll_msg and poll_msg.poll:
+                    POLL_LOOKUP[poll_msg.poll.id] = {
+                        "chat_key": chat_key,
+                        "correct_id": correct_id
+                    }
             except Exception as fb_err:
                 logger.error(f"Secondary poll fallback failed: {fb_err}")
 
         # 1. Wait for 15-second voting period to complete
         await asyncio.sleep(15)
 
-        # 2. Post the Solution Card
+        # 2. Post the Clean Solution Card
         full_solution = item.get("solution", "") or item.get("concept", "No additional notes.")
         pro_tip = item.get("pro_tip", "")
-        correct_text = options[correct_id] if correct_id < len(options) else "Correct Option"
-
         letters = ["A", "B", "C", "D"]
-        opt_breakdown_lines = []
-        for o_i, o_text in enumerate(options):
-            l_char = letters[o_i] if o_i < len(letters) else str(o_i + 1)
-            if o_i == correct_id:
-                opt_breakdown_lines.append(f"✅ *{l_char}) {o_text}* (CORRECT ANSWER)")
-            else:
-                opt_breakdown_lines.append(f"❌ *{l_char}) {o_text}* (INCORRECT)")
-
-        opt_breakdown_str = "\n".join(opt_breakdown_lines)
+        correct_letter = letters[correct_id] if correct_id < len(letters) else str(correct_id + 1)
+        correct_text = options[correct_id] if correct_id < len(options) else "Correct Option"
 
         solution_card = (
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 *ANSWER & SOLUTION (Q {idx + 1}/{total_q})*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{opt_breakdown_str}\n\n"
+            f"✅ *Correct Answer:* Option {correct_letter} — {correct_text}\n\n"
             f"📝 *Detailed Explanation:*\n{full_solution}\n\n"
         )
         if pro_tip:
             solution_card += f"💡 *Exam Trick & Key Rule:*\n`{pro_tip}`\n\n"
+
+        source_ref = item.get("source_ref", "")
+        if source_ref:
+            solution_card += f"📚 *Source Ref:* `{source_ref}`\n\n"
 
         solution_card += f"⏳ _Next question starting in 4 seconds..._"
 
@@ -988,23 +1617,71 @@ async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEF
         # 3. Intermission before next question
         await asyncio.sleep(4)
 
-    # ----------------- FINAL TEST COMPLETION -----------------
-    final_text = (
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 *TEST COMPLETED*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📖 *Topic:* `{session['topic']}`\n"
-        f"📊 *Total Questions:* `{total_q}`\n\n"
-        f"🎉 *All questions answered! Check your individual poll scores in chat.*\n"
-        f"👉 To run another quiz on any topic or PDF, use `/start` in bot DM."
-    )
+    # ----------------- FINAL TEST COMPLETION & RANKING LEADERBOARD -----------------
+    scores = session.get("scores", {})
+    leaderboard_lines = [
+        "━━━━━━━━━━━━━━━━━━━━━",
+        "🏆 *TEST LEADERBOARD & FINAL RANKING*",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        f"📖 *Topic:* `{session['topic']}`",
+        f"📊 *Total Questions:* `{total_q}`\n"
+    ]
+
+    if scores:
+        sorted_users = sorted(
+            scores.values(),
+            key=lambda x: (x["correct"], -x["attempts"]),
+            reverse=True
+        )
+        medals = ["🥇", "🥈", "🥉", "🎖️", "🎖️", "🎖️", "🎖️", "🎖️", "🎖️", "🎖️"]
+        for rank, u in enumerate(sorted_users[:15]):
+            medal = medals[rank] if rank < len(medals) else "👤"
+            correct = u["correct"]
+            att = u["attempts"]
+            pct = int((correct / total_q) * 100)
+            leaderboard_lines.append(
+                f"{medal} *Rank {rank + 1}:* {u['name']} — `{correct}/{total_q}` Correct ({pct}% Accuracy) • {att} Att"
+            )
+        leaderboard_lines.append(f"\n━━━━━━━━━━━━━━━━━━━━━\n👥 *Total Candidates Attempted:* `{len(scores)}`")
+        leaderboard_lines.append("🎉 *Congratulations to all top performers!*")
+    else:
+        leaderboard_lines.append("🎉 *Quiz session completed! Good effort everyone.*")
+
+    leaderboard_lines.append("\n👉 *To launch the next test on any topic or PDF, send `/start` in bot DM.*")
 
     await context.bot.send_message(
         chat_id=group_chat_id,
-        text=final_text,
+        text="\n".join(leaderboard_lines),
         parse_mode="Markdown"
     )
     ACTIVE_GROUP_QUIZZES.pop(chat_key, None)
+
+
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tracks live participant votes and computes real-time candidate scores."""
+    answer = update.poll_answer
+    poll_id = answer.poll_id
+    user = answer.user
+    selected = answer.option_ids[0] if answer.option_ids else -1
+
+    if poll_id in POLL_LOOKUP:
+        info = POLL_LOOKUP[poll_id]
+        chat_key = info["chat_key"]
+        session = ACTIVE_GROUP_QUIZZES.get(chat_key)
+        if session:
+            user_id = user.id
+            if user_id not in session["scores"]:
+                name = user.first_name or "Candidate"
+                if user.last_name:
+                    name += f" {user.last_name}"
+                session["scores"][user_id] = {
+                    "name": name,
+                    "correct": 0,
+                    "attempts": 0
+                }
+            session["scores"][user_id]["attempts"] += 1
+            if selected == info["correct_id"]:
+                session["scores"][user_id]["correct"] += 1
 
 
 # ----------------- MAIN INITIALIZATION -----------------
@@ -1035,9 +1712,12 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_admin_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_admin_text))
     app.add_handler(CallbackQueryHandler(handle_mode_callback, pattern=r"^mode_"))
+    app.add_handler(CallbackQueryHandler(handle_mock_selection, pattern=r"^mock_len:"))
+    app.add_handler(CallbackQueryHandler(handle_subject_button_selection, pattern=r"^sub_sel:"))
     app.add_handler(CallbackQueryHandler(handle_admin_topic_choice, pattern=r"^adm_top:"))
+    app.add_handler(PollAnswerHandler(handle_poll_answer))
 
-    logger.info("Native QuizBot engine active with full group voting enabled.")
+    logger.info("Native QuizBot engine active with full group voting and leaderboard rankings.")
     app.run_polling(drop_pending_updates=True, poll_interval=1.0, timeout=30)
 
 
