@@ -202,7 +202,11 @@ def clean_json_response(raw_text: str) -> List[Dict[str, Any]]:
     if start != -1 and end != -1:
         text = text[start:end+1]
 
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except Exception:
+        fixed_text = re.sub(r",\s*([\]}])", r"\1", text)
+        return json.loads(fixed_text)
 
 
 # ----------------- GEMINI PDF QUESTION SYNTHESIS ENGINE -----------------
@@ -231,15 +235,8 @@ For each question provide:
 Return ONLY a valid JSON array of objects.
 """
 
-    candidate_models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash-8b", "gemini-1.5-flash"]
-
-    if genai_client:
-        try:
-            live_models = [m.name.replace("models/", "") for m in genai_client.models.list() if "generateContent" in str(getattr(m, "supported_generation_methods", []))]
-            if live_models:
-                candidate_models = live_models + [m for m in candidate_models if m not in live_models]
-        except Exception as e:
-            logger.warning(f"Could not fetch dynamic live models: {e}")
+    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash-exp"]
+    errors_log = []
 
     # Method 1: Try modern google-genai SDK
     if genai_client:
@@ -278,12 +275,14 @@ Return ONLY a valid JSON array of objects.
                         return grouped, ""
                 except Exception as m_err:
                     logger.warning(f"Model {m_name} failed: {m_err}")
+                    errors_log.append(f"{m_name}: {m_err}")
 
         except Exception as e:
             logger.warning(f"Modern genai error: {e}")
+            errors_log.append(f"Modern SDK: {e}")
 
     # Method 2: Try legacy google.generativeai SDK
-    if legacy_model:
+    if legacy_genai and GEMINI_API_KEY:
         try:
             logger.info("Synthesizing questions using legacy google.generativeai SDK...")
             uploaded = legacy_genai.upload_file(file_path, mime_type="application/pdf")
@@ -294,18 +293,25 @@ Return ONLY a valid JSON array of objects.
                     break
                 time.sleep(3)
 
-            response = legacy_model.generate_content([uploaded, prompt])
-            data = clean_json_response(response.text)
-            grouped = {}
-            for item in data:
-                t = item.get("topic", "General Section").strip()
-                if t not in grouped:
-                    grouped[t] = []
-                grouped[t].append(item)
-            if grouped:
-                return grouped, ""
+            for m_name in ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-pro"]:
+                try:
+                    mod = legacy_genai.GenerativeModel(m_name)
+                    response = mod.generate_content([uploaded, prompt])
+                    data = clean_json_response(response.text)
+                    grouped = {}
+                    for item in data:
+                        t = item.get("topic", "General Section").strip()
+                        if t not in grouped:
+                            grouped[t] = []
+                        grouped[t].append(item)
+                    if grouped:
+                        return grouped, ""
+                except Exception as leg_m_err:
+                    logger.warning(f"Legacy model {m_name} failed: {leg_m_err}")
+                    errors_log.append(f"Legacy {m_name}: {leg_m_err}")
         except Exception as e:
             logger.warning(f"Legacy genai error: {e}")
+            errors_log.append(f"Legacy SDK: {e}")
 
     # Method 3: Local Text Page Chunking Fallback
     try:
@@ -327,8 +333,9 @@ Return ONLY a valid JSON array of objects.
                             model=m_name,
                             contents=fallback_prompt
                         )
-                    elif legacy_model:
-                        resp = legacy_model.generate_content(fallback_prompt)
+                    elif legacy_genai:
+                        mod = legacy_genai.GenerativeModel(m_name)
+                        resp = mod.generate_content(fallback_prompt)
                     else:
                         resp = None
 
@@ -344,14 +351,17 @@ Return ONLY a valid JSON array of objects.
                             return grouped, ""
                 except Exception as fb_m_err:
                     logger.warning(f"Fallback model {m_name} failed: {fb_m_err}")
+                    errors_log.append(f"Fallback {m_name}: {fb_m_err}")
     except Exception as e:
         logger.error(f"Fallback extraction error: {e}")
+        errors_log.append(f"Extraction error: {e}")
 
-    return {}, "Could not synthesize questions from PDF. Check API key and format."
+    last_err_text = "\n".join(errors_log[-2:]) if errors_log else "Could not synthesize questions from PDF."
+    return {}, last_err_text
 
 
 # ----------------- TOPIC-BASED ZERO-DOCUMENT GENERATOR (BATCHED) -----------------
-def generate_topic_batch(topic_name: str, batch_count: int, offset: int) -> List[Dict[str, Any]]:
+def generate_topic_batch(topic_name: str, batch_count: int, offset: int) -> Tuple[List[Dict[str, Any]], str]:
     prompt = f"""
 You are an expert exam paper creator for UP Super TET (उत्तर प्रदेश सुपर टीईटी) and state teacher recruitment examinations.
 Topic: "{topic_name}"
@@ -378,8 +388,10 @@ Return ONLY a valid JSON array of {batch_count} objects with this format:
   }}
 ]
 """
-    candidate_models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash-8b", "gemini-1.5-flash"]
+    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash-exp"]
+    err_msgs = []
     
+    # 1. Modern google-genai SDK
     if genai_client:
         for m_name in candidate_models:
             try:
@@ -394,22 +406,31 @@ Return ONLY a valid JSON array of {batch_count} objects with this format:
                     contents=prompt,
                     config=config
                 )
-                data = clean_json_response(resp.text)
-                if isinstance(data, list) and len(data) > 0:
-                    return data
+                if resp and resp.text:
+                    data = clean_json_response(resp.text)
+                    if isinstance(data, list) and len(data) > 0:
+                        return data, ""
             except Exception as e:
-                logger.warning(f"Batch generation model {m_name} failed: {e}")
+                logger.warning(f"Modern model {m_name} failed: {e}")
+                err_msgs.append(f"{m_name}: {e}")
 
-    if legacy_model:
-        try:
-            resp = legacy_model.generate_content(prompt)
-            data = clean_json_response(resp.text)
-            if isinstance(data, list) and len(data) > 0:
-                return data
-        except Exception as e:
-            logger.warning(f"Legacy batch topic generation error: {e}")
+    # 2. Legacy google.generativeai SDK fallback
+    if legacy_genai and GEMINI_API_KEY:
+        legacy_models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-pro"]
+        for m_name in legacy_models:
+            try:
+                mod = legacy_genai.GenerativeModel(m_name)
+                resp = mod.generate_content(prompt)
+                if resp and resp.text:
+                    data = clean_json_response(resp.text)
+                    if isinstance(data, list) and len(data) > 0:
+                        return data, ""
+            except Exception as e:
+                logger.warning(f"Legacy model {m_name} failed: {e}")
+                err_msgs.append(f"Legacy {m_name}: {e}")
 
-    return []
+    last_error = "\n".join(err_msgs[-2:]) if err_msgs else "No compatible Gemini model found or key invalid."
+    return [], last_error
 
 
 def generate_custom_topic_mcqs(topic_name: str, count: int) -> Tuple[List[Dict[str, Any]], str]:
@@ -422,25 +443,28 @@ def generate_custom_topic_mcqs(topic_name: str, count: int) -> Tuple[List[Dict[s
     batch_size = 20
     remaining = count
     offset = 0
+    last_err = ""
 
     while remaining > 0:
         current_batch_size = min(remaining, batch_size)
         logger.info(f"Generating batch of {current_batch_size} questions for '{topic_name}'...")
-        batch_mcqs = generate_topic_batch(topic_name, current_batch_size, offset)
+        batch_mcqs, err = generate_topic_batch(topic_name, current_batch_size, offset)
         
         if batch_mcqs:
             all_mcqs.extend(batch_mcqs)
             offset += len(batch_mcqs)
             remaining -= len(batch_mcqs)
         else:
+            last_err = err
             if current_batch_size > 10:
                 current_batch_size = 10
-                batch_mcqs = generate_topic_batch(topic_name, current_batch_size, offset)
+                batch_mcqs, err2 = generate_topic_batch(topic_name, current_batch_size, offset)
                 if batch_mcqs:
                     all_mcqs.extend(batch_mcqs)
                     offset += len(batch_mcqs)
                     remaining -= len(batch_mcqs)
                 else:
+                    last_err = err2
                     break
             else:
                 break
@@ -448,7 +472,7 @@ def generate_custom_topic_mcqs(topic_name: str, count: int) -> Tuple[List[Dict[s
     if all_mcqs:
         return all_mcqs[:count], ""
 
-    return [], "Could not synthesize questions for this topic. Verify API key and network."
+    return [], last_err or "Could not synthesize questions for this topic. Verify API key and network."
 
 
 # ----------------- ADMIN HANDLERS -----------------
