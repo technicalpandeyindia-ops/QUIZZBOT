@@ -17,6 +17,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -27,11 +28,11 @@ from telegram.ext import (
 )
 
 # ----------------- CONFIGURATION -----------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 PORT = int(os.getenv("PORT", 8080))
-SELF_PING_URL = os.getenv("SELF_PING_URL", os.getenv("RENDER_EXTERNAL_URL", ""))
+SELF_PING_URL = os.getenv("SELF_PING_URL", os.getenv("RENDER_EXTERNAL_URL", "")).strip()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -40,8 +41,12 @@ logger = logging.getLogger(__name__)
 
 START_TIME = time.time()
 
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+else:
+    logger.warning("GEMINI_API_KEY not configured in environment!")
+    gemini_model = None
 
 # Session state containers
 ADMIN_STATE: Dict[int, Dict[str, Any]] = {}
@@ -91,7 +96,7 @@ def start_self_pinger():
         try:
             time.sleep(500)
             req = urllib.request.Request(target, headers={"User-Agent": "RenderSelfPinger/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status == 200:
                     logger.info("Self-ping success. Instance awake.")
         except Exception as e:
@@ -110,6 +115,10 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 
 def analyze_pdf_and_generate_modern_mcqs(raw_text: str) -> Dict[str, List[Dict[str, Any]]]:
+    if not gemini_model:
+        logger.error("Gemini model not initialized. Check GEMINI_API_KEY.")
+        return {}
+
     sample_text = raw_text[:40000]
     prompt = f"""
 You are an advanced exam design intelligence. Analyze the document, divide it into distinct chapters/topics, and synthesize modern-style, competitive exam questions (including Assertion-Reason, Statement Evaluation, Case Scenarios, and Deep Conceptual MCQs).
@@ -300,7 +309,7 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
         "mcqs": mcqs,
         "current_index": 0,
         "topic": topic,
-        "scores": {},       # { user_id: { "name": "...", "correct": 0, "total": 0 } }
+        "scores": {},
         "answered_users": set()
     }
 
@@ -325,7 +334,6 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
         q_type = item.get("q_type", "CONCEPTUAL").upper()
         diff_badge = {"EASY": "🟢 EASY", "MEDIUM": "🟡 MEDIUM", "HARD": "🔴 ADVANCED"}.get(diff, "🟡 MEDIUM")
 
-        # Modern Question Card
         progress_bar = "█" * (idx + 1) + "░" * (total_q - idx - 1)
         q_card = (
             f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -358,10 +366,8 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
             parse_mode="Markdown"
         )
 
-        # 5-second countdown for member participation
         await asyncio.sleep(5)
 
-        # Build Comprehensive Modern Solution & Analysis Card
         correct_idx = item["correct_index"]
         correct_letter = chr(65 + correct_idx)
         correct_text = item["options"][correct_idx]
@@ -399,7 +405,7 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
 
         await asyncio.sleep(5)
 
-    # ----------------- LEADERBOARD SUMMARY -----------------
+    # Leaderboard Summary
     scores = session.get("scores", {})
     leaderboard_text = (
         f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -446,7 +452,6 @@ async def handle_user_selection(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("⌛ Time is up for this question!", show_alert=True)
         return
 
-    # Check if user already answered this specific question
     user_id = user.id
     if user_id in session["answered_users"]:
         await query.answer("⚠️ You have already locked your answer for this question!", show_alert=True)
@@ -454,7 +459,6 @@ async def handle_user_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
     session["answered_users"].add(user_id)
 
-    # Initialize user score tracking
     if user_id not in session["scores"]:
         session["scores"][user_id] = {
             "name": user.first_name,
@@ -466,7 +470,6 @@ async def handle_user_selection(update: Update, context: ContextTypes.DEFAULT_TY
     item = session["mcqs"][q_idx]
     correct_idx = item["correct_index"]
 
-    # Real-time feedback alert
     if opt_idx == correct_idx:
         session["scores"][user_id]["correct"] += 1
         score_now = session["scores"][user_id]["correct"]
@@ -478,12 +481,30 @@ async def handle_user_selection(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer(text=feedback, show_alert=True)
 
 
-# ----------------- MAIN EXECUTION -----------------
+# ----------------- MAIN EXECUTION WITH RESILIENT TIMEOUTS -----------------
 def main():
+    if not TELEGRAM_BOT_TOKEN:
+        logger.critical("FATAL: TELEGRAM_BOT_TOKEN is missing in environment!")
+        return
+
     threading.Thread(target=start_uptime_server, daemon=True).start()
     threading.Thread(target=start_self_pinger, daemon=True).start()
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # Configure robust HTTPX networking timeouts for Render / Cloud latency
+    request_config = HTTPXRequest(
+        connect_timeout=60.0,
+        read_timeout=60.0,
+        write_timeout=60.0,
+        pool_timeout=60.0
+    )
+
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .request(request_config)
+        .get_updates_request(request_config)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_admin_pdf))
@@ -491,8 +512,24 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_admin_topic_choice, pattern=r"^adm_top:"))
     app.add_handler(CallbackQueryHandler(handle_user_selection, pattern=r"^opt:"))
 
-    logger.info("Modern AI Quiz Bot listening.")
-    app.run_polling(drop_pending_updates=True)
+    logger.info("Starting polling with resilient 60s network timeouts...")
+    
+    # Retry loop around run_polling to survive temporary Render network cold starts
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            app.run_polling(
+                drop_pending_updates=True,
+                poll_interval=1.0,
+                timeout=30
+            )
+            break
+        except Exception as err:
+            logger.error(f"Polling crashed (Attempt {attempt}/{max_retries}): {err}")
+            if attempt < max_retries:
+                time.sleep(5)
+            else:
+                raise err
 
 
 if __name__ == "__main__":
