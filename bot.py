@@ -9,14 +9,17 @@ import threading
 import tempfile
 import re
 import urllib.request
+import warnings
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Any, List, Tuple
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import gdown
 import requests
 import pypdf
 
-# Dual SDK Support: Modern google-genai + google.generativeai
+# Dual SDK Support: Modern google-genai + legacy fallback
 try:
     from google import genai as new_genai
     from google.genai import types as new_genai_types
@@ -24,7 +27,10 @@ try:
 except ImportError:
     HAS_NEW_GENAI = False
 
-import google.generativeai as legacy_genai
+try:
+    import google.generativeai as legacy_genai
+except ImportError:
+    legacy_genai = None
 
 from telegram import (
     Update,
@@ -69,12 +75,15 @@ if GEMINI_API_KEY:
         except Exception as e:
             logger.warning(f"Could not init modern genai client: {e}")
     
-    try:
-        legacy_genai.configure(api_key=GEMINI_API_KEY)
-        legacy_model = legacy_genai.GenerativeModel("gemini-1.5-flash")
-        logger.info("Configured legacy google.generativeai.")
-    except Exception as e:
-        logger.warning(f"Legacy genai init error: {e}")
+    if legacy_genai:
+        try:
+            legacy_genai.configure(api_key=GEMINI_API_KEY)
+            legacy_model = legacy_genai.GenerativeModel("gemini-1.5-flash")
+            logger.info("Configured legacy google.generativeai.")
+        except Exception as e:
+            logger.warning(f"Legacy genai init error: {e}")
+            legacy_model = None
+    else:
         legacy_model = None
 else:
     logger.warning("GEMINI_API_KEY is not set!")
@@ -115,7 +124,6 @@ def start_uptime_server():
 
 
 def start_self_pinger():
-    # If SELF_PING_URL is a placeholder, fallback to local internal port
     target = SELF_PING_URL.rstrip("/") + "/" if SELF_PING_URL and "your-app-name" not in SELF_PING_URL else f"http://127.0.0.1:{PORT}/"
     logger.info(f"Keep-alive monitor targeting: {target}")
 
@@ -200,7 +208,7 @@ def clean_json_response(raw_text: str) -> List[Dict[str, Any]]:
     return json.loads(text)
 
 
-# ----------------- GEMINI QUESTION SYNTHESIS ENGINE -----------------
+# ----------------- GEMINI PDF QUESTION SYNTHESIS ENGINE -----------------
 def generate_questions_with_gemini(file_path: str) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
     if not GEMINI_API_KEY:
         return {}, "GEMINI_API_KEY is not configured in Render environment."
@@ -228,8 +236,6 @@ Return ONLY a valid JSON array of objects.
 """
 
     errors_log = []
-
-    # Dynamic model discovery + recommended target
     candidate_models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash-8b", "gemini-1.5-flash"]
 
     if genai_client:
@@ -359,7 +365,7 @@ def generate_custom_topic_mcqs(topic_name: str, count: int) -> Tuple[List[Dict[s
     if not GEMINI_API_KEY:
         return [], "GEMINI_API_KEY is not configured in Render environment."
 
-    count = max(5, min(count, 100))  # Bound between 5 and 100
+    count = max(5, min(count, 100))
 
     prompt = f"""
 You are an expert examiner specializing in the latest UP Super TET (उत्तर प्रदेश सुपर टीईटी) and state teacher recruitment / competitive exams.
@@ -483,6 +489,52 @@ async def handle_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "📄 *Send your PDF document or paste a Google Drive link right here in chat!*",
             parse_mode="Markdown"
         )
+
+
+async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+
+    user_id = update.effective_user.id
+    if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+
+    doc = update.message.document
+    if not doc or not doc.file_name or not doc.file_name.lower().endswith(".pdf"):
+        await update.message.reply_text("❌ Please send a valid `.pdf` file.")
+        return
+
+    file_size_mb = (doc.file_size or 0) / (1024 * 1024)
+
+    if file_size_mb > 20.0:
+        await update.message.reply_text(
+            f"📦 *Large File Detected:* `{file_size_mb:.1f} MB`\n\n"
+            f"Telegram API restricts bot downloads to 20 MB.\n\n"
+            f"🚀 *How to process this entire {file_size_mb:.0f}MB book:*\n"
+            f"1. Upload the PDF to your **Google Drive**.\n"
+            f"2. Right click $\\to$ **Share** $\\to$ Set to *'Anyone with the link'*.\n"
+            f"3. **Paste the Drive link right here in chat!**",
+            parse_mode="Markdown"
+        )
+        return
+
+    status = await update.message.reply_text(f"⏳ *Step 1/3:* Downloading PDF (`{file_size_mb:.1f} MB`)...", parse_mode="Markdown")
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+        tmp_path = tmp_file.name
+
+    try:
+        file_obj = await context.bot.get_file(doc.file_id)
+        await file_obj.download_to_drive(custom_path=tmp_path)
+    except Exception as e:
+        logger.error(f"Download failure: {e}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        await status.edit_text(f"❌ *Download Error:* `{e}`")
+        return
+
+    await process_and_prompt_topics(update, context, status, tmp_path)
 
 
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
