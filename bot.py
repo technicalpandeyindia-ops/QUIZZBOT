@@ -209,6 +209,42 @@ def clean_json_response(raw_text: str) -> List[Dict[str, Any]]:
         return json.loads(fixed_text)
 
 
+def get_available_gemini_models() -> List[str]:
+    valid = []
+    if legacy_genai and GEMINI_API_KEY:
+        try:
+            for m in legacy_genai.list_models():
+                methods = getattr(m, "supported_generation_methods", [])
+                if "generateContent" in methods:
+                    name = m.name.replace("models/", "")
+                    valid.append(name)
+        except Exception as e:
+            logger.warning(f"Error querying legacy list_models: {e}")
+
+    if not valid and genai_client:
+        try:
+            for m in genai_client.models.list():
+                methods = getattr(m, "supported_generation_methods", [])
+                if "generateContent" in str(methods):
+                    name = m.name.replace("models/", "")
+                    valid.append(name)
+        except Exception as e:
+            logger.warning(f"Error querying genai_client.models.list: {e}")
+
+    if not valid:
+        valid = [
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash-latest",
+            "gemini-1.5-flash-002",
+            "gemini-1.5-flash-001",
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-8b",
+            "gemini-2.0-flash-exp"
+        ]
+    return valid
+
+
 # ----------------- GEMINI PDF QUESTION SYNTHESIS ENGINE -----------------
 def generate_questions_with_gemini(file_path: str) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
     if not GEMINI_API_KEY:
@@ -235,7 +271,7 @@ For each question provide:
 Return ONLY a valid JSON array of objects.
 """
 
-    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash-exp"]
+    candidate_models = get_available_gemini_models()
     errors_log = []
 
     # Method 1: Try modern google-genai SDK
@@ -293,7 +329,7 @@ Return ONLY a valid JSON array of objects.
                     break
                 time.sleep(3)
 
-            for m_name in ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-pro"]:
+            for m_name in candidate_models:
                 try:
                     mod = legacy_genai.GenerativeModel(m_name)
                     response = mod.generate_content([uploaded, prompt])
@@ -328,14 +364,14 @@ Return ONLY a valid JSON array of objects.
             fallback_prompt = prompt + f"\n\nContent:\n{raw_text}"
             for m_name in candidate_models:
                 try:
-                    if genai_client:
+                    if legacy_genai:
+                        mod = legacy_genai.GenerativeModel(m_name)
+                        resp = mod.generate_content(fallback_prompt)
+                    elif genai_client:
                         resp = genai_client.models.generate_content(
                             model=m_name,
                             contents=fallback_prompt
                         )
-                    elif legacy_genai:
-                        mod = legacy_genai.GenerativeModel(m_name)
-                        resp = mod.generate_content(fallback_prompt)
                     else:
                         resp = None
 
@@ -388,10 +424,24 @@ Return ONLY a valid JSON array of {batch_count} objects with this format:
   }}
 ]
 """
-    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash-exp"]
+    candidate_models = get_available_gemini_models()
     err_msgs = []
-    
-    # 1. Modern google-genai SDK
+
+    # 1. Try legacy google.generativeai SDK first
+    if legacy_genai and GEMINI_API_KEY:
+        for m_name in candidate_models:
+            try:
+                mod = legacy_genai.GenerativeModel(m_name)
+                resp = mod.generate_content(prompt)
+                if resp and resp.text:
+                    data = clean_json_response(resp.text)
+                    if isinstance(data, list) and len(data) > 0:
+                        return data, ""
+            except Exception as e:
+                logger.warning(f"Legacy model {m_name} failed: {e}")
+                err_msgs.append(f"Legacy {m_name}: {e}")
+
+    # 2. Try modern google-genai SDK
     if genai_client:
         for m_name in candidate_models:
             try:
@@ -413,21 +463,6 @@ Return ONLY a valid JSON array of {batch_count} objects with this format:
             except Exception as e:
                 logger.warning(f"Modern model {m_name} failed: {e}")
                 err_msgs.append(f"{m_name}: {e}")
-
-    # 2. Legacy google.generativeai SDK fallback
-    if legacy_genai and GEMINI_API_KEY:
-        legacy_models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-pro"]
-        for m_name in legacy_models:
-            try:
-                mod = legacy_genai.GenerativeModel(m_name)
-                resp = mod.generate_content(prompt)
-                if resp and resp.text:
-                    data = clean_json_response(resp.text)
-                    if isinstance(data, list) and len(data) > 0:
-                        return data, ""
-            except Exception as e:
-                logger.warning(f"Legacy model {m_name} failed: {e}")
-                err_msgs.append(f"Legacy {m_name}: {e}")
 
     last_error = "\n".join(err_msgs[-2:]) if err_msgs else "No compatible Gemini model found or key invalid."
     return [], last_error
