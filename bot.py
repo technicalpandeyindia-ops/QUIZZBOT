@@ -6,7 +6,9 @@ import json
 import asyncio
 import logging
 import threading
+import tempfile
 import urllib.request
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Any, List
 
@@ -45,15 +47,15 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 else:
-    logger.warning("GEMINI_API_KEY not configured in environment!")
+    logger.warning("GEMINI_API_KEY is not set!")
     gemini_model = None
 
-# Session state containers
+# Session storage
 ADMIN_STATE: Dict[int, Dict[str, Any]] = {}
 ACTIVE_GROUP_QUIZZES: Dict[str, Dict[str, Any]] = {}
 
 
-# ----------------- 24/7 UPTIME ROBOT & HEALTH SERVER -----------------
+# ----------------- UPTIME KEEP-ALIVE SERVER -----------------
 class UptimeHealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         uptime_seconds = int(time.time() - START_TIME)
@@ -65,7 +67,6 @@ class UptimeHealthHandler(BaseHTTPRequestHandler):
         response_data = {
             "status": "online",
             "uptime": uptime_str,
-            "uptime_seconds": uptime_seconds,
             "active_group_quizzes": len(ACTIVE_GROUP_QUIZZES)
         }
 
@@ -80,121 +81,138 @@ class UptimeHealthHandler(BaseHTTPRequestHandler):
 
 def start_uptime_server():
     server = HTTPServer(("0.0.0.0", PORT), UptimeHealthHandler)
-    logger.info(f"Uptime HTTP server running on port {PORT}")
     server.serve_forever()
 
 
 def start_self_pinger():
     if not SELF_PING_URL:
-        logger.info("No SELF_PING_URL specified. Relying on external UptimeRobot.")
         return
 
     target = SELF_PING_URL.rstrip("/") + "/"
-    logger.info(f"Self-pinger active targeting: {target}")
-
     while True:
         try:
             time.sleep(500)
             req = urllib.request.Request(target, headers={"User-Agent": "RenderSelfPinger/1.0"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status == 200:
-                    logger.info("Self-ping success. Instance awake.")
+                    logger.info("Self-ping success.")
         except Exception as e:
             logger.warning(f"Self-ping failed: {e}")
 
 
-# ----------------- MODERN GEMINI QUESTION & SOLUTION GENERATOR -----------------
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-    pages_text = []
-    for page in reader.pages:
-        txt = page.extract_text()
-        if txt:
-            pages_text.append(txt)
-    return "\n".join(pages_text)
-
-
-def analyze_pdf_and_generate_modern_mcqs(raw_text: str) -> Dict[str, List[Dict[str, Any]]]:
+# ----------------- GEMINI FILE API (UNLIMITED SIZE UP TO 2GB) -----------------
+def process_pdf_file_via_gemini(file_path: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Uploads any size PDF directly to Gemini File API and synthesizes multi-topic questions."""
     if not gemini_model:
-        logger.error("Gemini model not initialized. Check GEMINI_API_KEY.")
         return {}
 
-    sample_text = raw_text[:40000]
-    prompt = f"""
-You are an advanced exam design intelligence. Analyze the document, divide it into distinct chapters/topics, and synthesize modern-style, competitive exam questions (including Assertion-Reason, Statement Evaluation, Case Scenarios, and Deep Conceptual MCQs).
+    uploaded_file = None
+    try:
+        logger.info(f"Uploading {file_path} to Gemini File API...")
+        uploaded_file = genai.upload_file(file_path, mime_type="application/pdf")
+        
+        # Wait for file processing state if needed
+        time.sleep(2)
+
+        prompt = """
+You are an advanced exam design intelligence. Analyze this full book/document completely (including Hindi and English text, tables, and chapters).
+Scan all major chapters/topics and synthesize high-quality modern competitive exam MCQs for each section.
 
 For each question provide:
-1. "topic": Precise Chapter/Topic Name
+1. "topic": Specific Chapter or Topic Name (in the language of the document)
 2. "difficulty": "EASY" | "MEDIUM" | "HARD"
-3. "q_type": "CONCEPTUAL" | "ASSERTION-REASON" | "STATEMENT-BASED" | "APPLICATION"
-4. "question": High quality, structured question text
-5. "options": Exactly 4 distinct options ["A text", "B text", "C text", "D text"]
+3. "q_type": "CONCEPTUAL" | "ASSERTION-REASON" | "STATEMENT-BASED" | "CURRENT-AFFAIRS"
+4. "question": High quality question in the same language as the book (Hindi or English)
+5. "options": Exactly 4 distinct options ["Option A", "Option B", "Option C", "Option D"]
 6. "correct_index": 0, 1, 2, or 3
-7. "concept": Core theory or formula involved
-8. "solution": Detailed step-by-step resolution
-9. "option_breakdown": Why the correct option holds and why distractor options fail
-10. "pro_tip": Trap alert, exam trick, or common student misconception
+7. "concept": Core theory or fact involved
+8. "solution": Detailed step-by-step resolution and reasoning
+9. "option_breakdown": Why correct choice is right and other choices are wrong
+10. "pro_tip": Exam trap alert or key memory tip
 
-Return ONLY a JSON array matching this exact schema:
+Return ONLY a valid JSON array matching this exact schema:
 [
-  {{
-    "topic": "Topic Name",
-    "difficulty": "HARD",
-    "q_type": "STATEMENT-BASED",
-    "question": "Consider the following statements...",
-    "options": ["1 only", "2 only", "Both 1 and 2", "Neither 1 nor 2"],
-    "correct_index": 2,
-    "concept": "Fundamental principle description",
-    "solution": "Step-by-step logical proof and mathematical derivation.",
-    "option_breakdown": "Option A misses factor X. Option B ignores constraint Y. Option C satisfies both conditions.",
-    "pro_tip": "Look out for absolute qualifiers like 'always' or 'never' in statement 1."
-  }}
+  {
+    "topic": "Chapter Name",
+    "difficulty": "MEDIUM",
+    "q_type": "CONCEPTUAL",
+    "question": "Question text here",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correct_index": 0,
+    "concept": "Underlying concept",
+    "solution": "Detailed explanation",
+    "option_breakdown": "Option analysis",
+    "pro_tip": "Key memory tip"
+  }
 ]
-
-Content:
-{sample_text}
 """
-    response = gemini_model.generate_content(
-        prompt,
-        generation_config={"response_mime_type": "application/json"}
-    )
-    try:
+        response = gemini_model.generate_content(
+            [uploaded_file, prompt],
+            generation_config={"response_mime_type": "application/json"}
+        )
         data = json.loads(response.text)
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for item in data:
-            topic_name = item.get("topic", "General Section").strip()
-            if topic_name not in grouped:
-                grouped[topic_name] = []
-            grouped[topic_name].append(item)
+            t = item.get("topic", "General Section").strip()
+            if t not in grouped:
+                grouped[t] = []
+            grouped[t].append(item)
         return grouped
     except Exception as e:
-        logger.error(f"Gemini modern parse error: {e}")
+        logger.error(f"Gemini processing failure: {e}")
         return {}
+    finally:
+        if uploaded_file:
+            try:
+                genai.delete_file(uploaded_file.name)
+            except Exception:
+                pass
 
 
-# ----------------- ADMIN INTERFACE (PRIVATE DM) -----------------
+def download_file_from_url(url: str, output_path: str):
+    """Downloads large files from direct link or Google Drive link."""
+    # Convert standard Google Drive view link to direct download link
+    drive_match = re.search(r"/d/([a-zA-Z0-9_-]+)", url) or re.search(r"id=([a-zA-Z0-9_-]+)", url)
+    if "drive.google.com" in url and drive_match:
+        file_id = drive_match.group(1)
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    )
+    with urllib.request.urlopen(req, timeout=120) as response, open(output_path, "wb") as out_file:
+        chunk_size = 1024 * 1024  # 1MB chunks
+        while True:
+            chunk = response.read(chunk_size)
+            if not chunk:
+                break
+            out_file.write(chunk)
+
+
+# ----------------- ADMIN INTERFACE -----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if update.effective_chat.type != "private":
-        await update.message.reply_text("👋 Bot is active. Admin runs setups in private DM.")
+        await update.message.reply_text("👋 Bot active. Admin commands run in private DM.")
         return
 
     is_admin = (user_id == ADMIN_USER_ID or ADMIN_USER_ID == 0)
     if not is_admin:
-        await update.message.reply_text("👋 Hello! Tests will run in your configured community channel/group.")
+        await update.message.reply_text("👋 Hello! Tests will run in your configured community group.")
         return
 
     await update.message.reply_text(
-        "⚡ *AI-Powered Modern Exam Engine*\n\n"
-        "1. Send your `.pdf` syllabus / book / study material.\n"
-        "2. Gemini extracts topics & generates modern-style questions (Assertion-Reason, Statement-based, Conceptual).\n"
-        "3. Choose your target chapter & group username.\n"
-        "4. Live quiz runs with instant feedback, live leaderboards, and detailed analytical solutions.",
+        "⚡ *AI Exam & PDF Quiz Engine*\n\n"
+        "📥 *Two Ways to Ingest Full Material:*\n"
+        "1. **Direct Upload**: Send any `.pdf` document up to 20 MB directly.\n"
+        "2. **Direct Link (Any Size: 100MB+, 500MB, Full Books)**: Paste a Google Drive or direct web link to the PDF.\n\n"
+        "👉 _Send a PDF file or paste a Link to start!_",
         parse_mode="Markdown"
     )
 
 
-async def handle_admin_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
 
@@ -204,25 +222,100 @@ async def handle_admin_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     doc = update.message.document
-    if not doc.file_name.lower().endswith(".pdf"):
+    if not doc or not doc.file_name or not doc.file_name.lower().endswith(".pdf"):
         await update.message.reply_text("❌ Please send a valid `.pdf` file.")
         return
 
-    status = await update.message.reply_text("⏳ *Step 1/3:* Ingesting PDF & reading document stream...", parse_mode="Markdown")
-    file_obj = await context.bot.get_file(doc.file_id)
-    pdf_bytes = await file_obj.download_as_bytearray()
+    file_size_mb = (doc.file_size or 0) / (1024 * 1024)
 
-    await status.edit_text("🧠 *Step 2/3:* Gemini AI generating modern competitive exam questions & deep solutions...", parse_mode="Markdown")
-    loop = asyncio.get_running_loop()
-    raw_text = await loop.run_in_executor(None, extract_text_from_pdf, bytes(pdf_bytes))
-
-    if not raw_text.strip():
-        await status.edit_text("❌ Could not extract text from document.")
+    # If > 20MB, Telegram blocks direct download
+    if file_size_mb > 20.0:
+        await update.message.reply_text(
+            f"📦 *Large File Detected:* `{file_size_mb:.1f} MB`\n\n"
+            f"Telegram API blocks bot downloads over 20 MB.\n\n"
+            f"🚀 *Instant Solution (Upload Full 118MB Book at once):*\n"
+            f"1. Upload the PDF to your **Google Drive**.\n"
+            f"2. Set sharing to *'Anyone with the link'*\n"
+            f"3. **Paste the Drive link right here in chat!**\n\n"
+            f"The bot will ingest the full book directly into Gemini AI with zero size limits.",
+            parse_mode="Markdown"
+        )
         return
 
-    grouped = await loop.run_in_executor(None, analyze_pdf_and_generate_modern_mcqs, raw_text)
+    status = await update.message.reply_text(f"⏳ *Step 1/3:* Downloading PDF (`{file_size_mb:.1f} MB`)...", parse_mode="Markdown")
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+        tmp_path = tmp_file.name
+
+    try:
+        file_obj = await context.bot.get_file(doc.file_id)
+        await file_obj.download_to_drive(custom_path=tmp_path)
+    except Exception as e:
+        logger.error(f"Download failure: {e}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        await status.edit_text(f"❌ *Download Error:* `{e}`")
+        return
+
+    await process_and_prompt_topics(update, context, status, tmp_path)
+
+
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+
+    user_id = update.effective_user.id
+    state = ADMIN_STATE.get(user_id, {})
+    text = update.message.text.strip()
+
+    # If admin is in middle of providing group username
+    if state.get("step") == "AWAITING_GROUP":
+        await handle_admin_group_input(update, context)
+        return
+
+    # Check if admin sent a URL / Google Drive link
+    if text.startswith("http://") or text.startswith("https://"):
+        if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+            await update.message.reply_text("⛔ Unauthorized.")
+            return
+
+        status = await update.message.reply_text("⏳ *Step 1/3:* Fetching full document from link (Any size)...", parse_mode="Markdown")
+        
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, download_file_from_url, text, tmp_path)
+        except Exception as e:
+            logger.error(f"URL download failure: {e}")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            await status.edit_text(f"❌ *Failed to download from link:* `{e}`\nEnsure link is publicly accessible.")
+            return
+
+        await process_and_prompt_topics(update, context, status, tmp_path)
+
+
+async def process_and_prompt_topics(update: Update, context: ContextTypes.DEFAULT_TYPE, status_msg, file_path: str):
+    user_id = update.effective_user.id
+    await status_msg.edit_text("🧠 *Step 2/3:* Gemini AI reading full book & generating chapter questions...", parse_mode="Markdown")
+
+    loop = asyncio.get_running_loop()
+    try:
+        grouped = await loop.run_in_executor(None, process_pdf_file_via_gemini, file_path)
+    except Exception as e:
+        logger.error(f"AI Synthesis error: {e}")
+        grouped = {}
+    finally:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+
     if not grouped:
-        await status.edit_text("❌ Failed to synthesize questions from document.")
+        await status_msg.edit_text("❌ *No questions extracted.* Ensure the document is not password protected and contains readable material.")
         return
 
     ADMIN_STATE[user_id] = {
@@ -237,8 +330,8 @@ async def handle_admin_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = len(grouped[t_name])
         buttons.append([InlineKeyboardButton(f"📂 {t_name} • [{count} Qs]", callback_data=f"adm_top:{idx}")])
 
-    await status.edit_text(
-        "🎯 *PDF Processed Successfully!*\nSelect the chapter/topic to launch:",
+    await status_msg.edit_text(
+        f"🎯 *Full Document Analyzed!* Found {len(topics)} chapters/sections:\nChoose which topic to launch:",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
@@ -251,7 +344,7 @@ async def handle_admin_topic_choice(update: Update, context: ContextTypes.DEFAUL
     user_id = update.effective_user.id
     state = ADMIN_STATE.get(user_id)
     if not state or "topics_data" not in state:
-        await query.edit_message_text("❌ Session expired. Re-upload document.")
+        await query.edit_message_text("❌ Session expired. Re-upload or paste link.")
         return
 
     topic_idx = int(query.data.split(":")[1])
@@ -266,15 +359,12 @@ async def handle_admin_topic_choice(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text(
         f"🏷️ *Selected Topic:* `{chosen_topic}`\n\n"
         f"📢 *Send target group username or ID:*\n"
-        f"Examples: `@mygroup` or `-1001234567890`",
+        f"Examples: `@myquizgroup` or `-1001234567890`",
         parse_mode="Markdown"
     )
 
 
 async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        return
-
     user_id = update.effective_user.id
     state = ADMIN_STATE.get(user_id)
     if not state or state.get("step") != "AWAITING_GROUP":
@@ -287,19 +377,19 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
     try:
         intro_card = (
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🚀 *LIVE ARENA: MODERN MCQ TEST*\n"
+            f"🚀 *LIVE ARENA: LIVE MCQ TEST*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📖 *Topic:* `{topic}`\n"
             f"📊 *Questions:* `{len(mcqs)}`\n"
             f"⏱️ *Timer:* 5 seconds to lock answer\n"
-            f"💡 *Format:* Assertion, Statement & Conceptual MCQs\n"
-            f"🏆 *Live Member Leaderboard at completion*\n\n"
-            f"👉 _Get ready. First question incoming..._"
+            f"💡 *Step-by-step solutions posted automatically*\n"
+            f"🏆 *Live Leaderboard at completion*\n\n"
+            f"👉 _First question incoming..._"
         )
         sent = await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
         group_chat_id = sent.chat.id
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to reach `{target_group}`: `{e}`\nCheck bot permissions and try again:")
+        await update.message.reply_text(f"❌ Failed to reach `{target_group}`: `{e}`\nCheck bot admin permissions and try again:")
         return
 
     state["step"] = "LAUNCHED"
@@ -372,7 +462,7 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
         correct_letter = chr(65 + correct_idx)
         correct_text = item["options"][correct_idx]
 
-        concept = item.get("concept", "Key theoretical principle.")
+        concept = item.get("concept", "")
         solution = item.get("solution", "Step-by-step resolution.")
         breakdown = item.get("option_breakdown", "")
         pro_tip = item.get("pro_tip", "")
@@ -382,13 +472,14 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
             f"🎯 *ANSWER KEY & DEEP ANALYSIS (Q{idx + 1})*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"✅ *Correct Choice:* *{correct_letter}) {correct_text}*\n\n"
-            f"🧠 *Core Concept:*\n_{concept}_\n\n"
-            f"🔬 *Step-by-Step Solution:*\n{solution}\n\n"
         )
+        if concept:
+            solution_card += f"🧠 *Concept:* _{concept}_\n\n"
+        solution_card += f"🔬 *Explanation & Solution:*\n{solution}\n\n"
         if breakdown:
-            solution_card += f"📊 *Option Elimination Analysis:*\n{breakdown}\n\n"
+            solution_card += f"📊 *Option Elimination:*\n{breakdown}\n\n"
         if pro_tip:
-            solution_card += f"💡 *Exam Pro-Tip / Trap Alert:*\n`{pro_tip}`\n\n"
+            solution_card += f"💡 *Pro-Tip:*\n`{pro_tip}`\n\n"
 
         solution_card += f"⏳ _Next question in 5 seconds..._"
 
@@ -424,7 +515,7 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
     else:
         leaderboard_text += "_No member votes recorded during this round._\n"
 
-    leaderboard_text += "\n🎉 *Session concluded! Upload new material in DM to run next test.*"
+    leaderboard_text += "\n🎉 *Session concluded!*"
 
     await context.bot.send_message(
         chat_id=group_chat_id,
@@ -454,7 +545,7 @@ async def handle_user_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
     user_id = user.id
     if user_id in session["answered_users"]:
-        await query.answer("⚠️ You have already locked your answer for this question!", show_alert=True)
+        await query.answer("⚠️ You have already answered this question!", show_alert=True)
         return
 
     session["answered_users"].add(user_id)
@@ -473,24 +564,23 @@ async def handle_user_selection(update: Update, context: ContextTypes.DEFAULT_TY
     if opt_idx == correct_idx:
         session["scores"][user_id]["correct"] += 1
         score_now = session["scores"][user_id]["correct"]
-        feedback = f"🎯 BINGO, {user.first_name}! ✅\nChoice ({chr(65 + opt_idx)}) is CORRECT!\nCurrent Score: {score_now} pts."
+        feedback = f"🎯 RIGHT ANSWER, {user.first_name}! ✅\n({chr(65 + opt_idx)}) is correct!\nScore: {score_now} pts."
     else:
         correct_letter = chr(65 + correct_idx)
-        feedback = f"❌ INCORECT, {user.first_name}!\nYou chose ({chr(65 + opt_idx)}).\nCorrect is ({correct_letter}). See deep solution breakdown below."
+        feedback = f"❌ WRONG, {user.first_name}!\nYou chose ({chr(65 + opt_idx)}).\nCorrect: ({correct_letter})."
 
     await query.answer(text=feedback, show_alert=True)
 
 
-# ----------------- MAIN EXECUTION WITH RESILIENT TIMEOUTS -----------------
+# ----------------- MAIN INITIALIZATION -----------------
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        logger.critical("FATAL: TELEGRAM_BOT_TOKEN is missing in environment!")
+        logger.critical("FATAL: TELEGRAM_BOT_TOKEN missing!")
         return
 
     threading.Thread(target=start_uptime_server, daemon=True).start()
     threading.Thread(target=start_self_pinger, daemon=True).start()
 
-    # Configure robust HTTPX networking timeouts for Render / Cloud latency
     request_config = HTTPXRequest(
         connect_timeout=60.0,
         read_timeout=60.0,
@@ -507,29 +597,13 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_admin_pdf))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_admin_group_input))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_admin_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_admin_text))
     app.add_handler(CallbackQueryHandler(handle_admin_topic_choice, pattern=r"^adm_top:"))
     app.add_handler(CallbackQueryHandler(handle_user_selection, pattern=r"^opt:"))
 
-    logger.info("Starting polling with resilient 60s network timeouts...")
-    
-    # Retry loop around run_polling to survive temporary Render network cold starts
-    max_retries = 5
-    for attempt in range(1, max_retries + 1):
-        try:
-            app.run_polling(
-                drop_pending_updates=True,
-                poll_interval=1.0,
-                timeout=30
-            )
-            break
-        except Exception as err:
-            logger.error(f"Polling crashed (Attempt {attempt}/{max_retries}): {err}")
-            if attempt < max_retries:
-                time.sleep(5)
-            else:
-                raise err
+    logger.info("Bot is active.")
+    app.run_polling(drop_pending_updates=True, poll_interval=1.0, timeout=30)
 
 
 if __name__ == "__main__":
