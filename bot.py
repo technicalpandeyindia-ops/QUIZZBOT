@@ -220,11 +220,12 @@ For each question provide:
 Return ONLY a valid JSON array of objects.
 """
 
+    errors_log = []
+
     # Method 1: Try modern google-genai SDK
     if genai_client:
         try:
             logger.info("Synthesizing questions using modern google-genai SDK...")
-            # Upload file
             uploaded = genai_client.files.upload(file=file_path)
             for _ in range(30):
                 f_state = genai_client.files.get(name=uploaded.name)
@@ -247,7 +248,8 @@ Return ONLY a valid JSON array of objects.
             if grouped:
                 return grouped, ""
         except Exception as e:
-            logger.warning(f"Modern genai SDK call error: {e}")
+            logger.warning(f"Modern genai error: {e}")
+            errors_log.append(f"Modern SDK: {e}")
 
     # Method 2: Try legacy google.generativeai SDK
     if legacy_model:
@@ -272,7 +274,8 @@ Return ONLY a valid JSON array of objects.
             if grouped:
                 return grouped, ""
         except Exception as e:
-            logger.warning(f"Legacy genai upload error: {e}")
+            logger.warning(f"Legacy genai error: {e}")
+            errors_log.append(f"Legacy SDK: {e}")
 
     # Method 3: Local Text Page Chunking Fallback
     try:
@@ -292,21 +295,27 @@ Return ONLY a valid JSON array of objects.
                     model="gemini-1.5-flash",
                     contents=fallback_prompt
                 )
-            else:
+            elif legacy_model:
                 resp = legacy_model.generate_content(fallback_prompt)
-            data = clean_json_response(resp.text)
-            grouped = {}
-            for item in data:
-                t = item.get("topic", "General Section").strip()
-                if t not in grouped:
-                    grouped[t] = []
-                grouped[t].append(item)
-            if grouped:
-                return grouped, ""
+            else:
+                resp = None
+
+            if resp:
+                data = clean_json_response(resp.text)
+                grouped = {}
+                for item in data:
+                    t = item.get("topic", "General Section").strip()
+                    if t not in grouped:
+                        grouped[t] = []
+                    grouped[t].append(item)
+                if grouped:
+                    return grouped, ""
     except Exception as e:
         logger.error(f"Fallback extraction error: {e}")
+        errors_log.append(f"Text Fallback: {e}")
 
-    return {}, "Could not authenticate or parse document with current GEMINI_API_KEY. Ensure your key has Generative Language API enabled."
+    detailed_err = "\n".join(errors_log) if errors_log else "Authentication failed."
+    return {}, detailed_err
 
 
 # ----------------- ADMIN HANDLERS -----------------
