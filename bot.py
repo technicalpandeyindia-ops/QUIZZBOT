@@ -11,7 +11,7 @@ import re
 import urllib.request
 import warnings
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -1143,20 +1143,32 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
+            group_chat_id = (await context.bot.get_chat(target_group)).id
             intro_card = (
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📋 *Exam Target:* `UP Super TET / Competitive`\n"
                 f"🎥 *YouTube Source:* `{video_title[:45]}`\n"
                 f"📊 *Questions:* `{len(mcqs)}`\n"
                 f"⏱️ *Timer:* `25s per question`\n"
+                f"⏳ *Start:* `Auto-starts in 10s or tap ▶️ Start Quiz Now`\n"
                 f"✅ *Correct mark:* `+1.0`\n"
                 f"➖ *Negative:* `None`\n"
                 f"👥 *Voting:* `Open for ALL group members`\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🚀 *Starting now — tap your answer on each poll!*"
+                f"🚀 *Tap [▶️ Start Quiz Now] to begin immediately or wait for countdown!*"
             )
-            await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
-            group_chat_id = (await context.bot.get_chat(target_group)).id
+            start_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("▶️ Start Quiz Now", callback_data=f"start_quiz:{group_chat_id}"),
+                    InlineKeyboardButton("⏳ Auto-Start (10s)", callback_data=f"autostart_info:{group_chat_id}")
+                ]
+            ])
+            intro_msg = await context.bot.send_message(
+                chat_id=target_group,
+                text=intro_card,
+                reply_markup=start_kb,
+                parse_mode="Markdown"
+            )
         except Exception as e:
             await status_msg.edit_text(f"❌ Failed to reach `{target_group}`: `{e}`\nCheck bot admin permissions and try again.")
             return
@@ -1168,10 +1180,11 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
             "mcqs": shuffled_mcqs,
             "current_index": 0,
-            "topic": video_title[:40]
+            "topic": video_title[:40],
+            "start_event": asyncio.Event()
         }
 
-        asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context))
+        asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context, intro_msg.message_id))
         return
 
     # Step: Admin providing custom model paper question count
@@ -1210,20 +1223,32 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
+            group_chat_id = (await context.bot.get_chat(target_group)).id
             intro_card = (
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📋 *Exam Target:* `UP Super TET Full Model Paper (संपूर्ण मॉडल पेपर)`\n"
                 f"📚 *Coverage:* `All 14 Subjects (Hindi, Sanskrit, Eng, Sci, Math, EV, CDP, Teaching Skills, GK/CA, Reasoning, IT, Life Skills)`\n"
                 f"📊 *Questions:* `{len(mcqs)}`\n"
                 f"⏱️ *Timer:* `25s per question`\n"
+                f"⏳ *Start:* `Auto-starts in 10s or tap ▶️ Start Quiz Now`\n"
                 f"✅ *Correct mark:* `+1.0`\n"
                 f"➖ *Negative:* `None`\n"
                 f"👥 *Voting:* `Open for ALL group members`\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🚀 *Starting now — tap your answer on each poll!*"
+                f"🚀 *Tap [▶️ Start Quiz Now] to begin immediately or wait for countdown!*"
             )
-            await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
-            group_chat_id = (await context.bot.get_chat(target_group)).id
+            start_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("▶️ Start Quiz Now", callback_data=f"start_quiz:{group_chat_id}"),
+                    InlineKeyboardButton("⏳ Auto-Start (10s)", callback_data=f"autostart_info:{group_chat_id}")
+                ]
+            ])
+            intro_msg = await context.bot.send_message(
+                chat_id=target_group,
+                text=intro_card,
+                reply_markup=start_kb,
+                parse_mode="Markdown"
+            )
         except Exception as e:
             await status_msg.edit_text(f"❌ Failed to reach `{target_group}`: `{e}`\nCheck bot admin permissions and try again.")
             return
@@ -1235,10 +1260,11 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
             "mcqs": shuffled_mcqs,
             "current_index": 0,
-            "topic": "UP Super TET Full Model Paper"
+            "topic": "UP Super TET Full Model Paper",
+            "start_event": asyncio.Event()
         }
 
-        asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context))
+        asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context, intro_msg.message_id))
         return
 
     # Step: Admin providing topic name
@@ -1291,20 +1317,32 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
+            group_chat_id = (await context.bot.get_chat(target_group)).id
             intro_card = (
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📋 *Exam Target:* `UP Super TET / Competitive`\n"
                 f"📖 *Topic:* `{topic}`\n"
                 f"📊 *Questions:* `{len(mcqs)}`\n"
                 f"⏱️ *Timer:* `25s per question`\n"
+                f"⏳ *Start:* `Auto-starts in 10s or tap ▶️ Start Quiz Now`\n"
                 f"✅ *Correct mark:* `+1.0`\n"
                 f"➖ *Negative:* `None`\n"
                 f"👥 *Voting:* `Open for ALL group members`\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🚀 *Starting now — tap your answer on each poll!*"
+                f"🚀 *Tap [▶️ Start Quiz Now] to begin immediately or wait for countdown!*"
             )
-            await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
-            group_chat_id = (await context.bot.get_chat(target_group)).id
+            start_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("▶️ Start Quiz Now", callback_data=f"start_quiz:{group_chat_id}"),
+                    InlineKeyboardButton("⏳ Auto-Start (10s)", callback_data=f"autostart_info:{group_chat_id}")
+                ]
+            ])
+            intro_msg = await context.bot.send_message(
+                chat_id=target_group,
+                text=intro_card,
+                reply_markup=start_kb,
+                parse_mode="Markdown"
+            )
         except Exception as e:
             await status_msg.edit_text(f"❌ Failed to reach `{target_group}`: `{e}`\nCheck bot admin permissions and try again.")
             return
@@ -1316,10 +1354,11 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
             "mcqs": shuffled_mcqs,
             "current_index": 0,
-            "topic": topic
+            "topic": topic,
+            "start_event": asyncio.Event()
         }
 
-        asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context))
+        asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context, intro_msg.message_id))
         return
 
     # PDF Question Count Step
@@ -1459,19 +1498,31 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
         mcqs = mcqs[:requested_count]
 
     try:
+        group_chat_id = (await context.bot.get_chat(target_group)).id
         intro_card = (
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📋 *Section / Chapter:* `{topic}`\n"
             f"📊 *Questions:* `{len(mcqs)}`\n"
             f"⏱️ *Timer:* `25s per question`\n"
+            f"⏳ *Start:* `Auto-starts in 10s or tap ▶️ Start Quiz Now`\n"
             f"✅ *Correct mark:* `+1.0`\n"
             f"➖ *Negative:* `None`\n"
             f"👥 *Voting:* `Open for ALL group members`\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🚀 *Starting now — tap your answer on each poll!*"
+            f"🚀 *Tap [▶️ Start Quiz Now] to begin immediately or wait for countdown!*"
         )
-        await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
-        group_chat_id = (await context.bot.get_chat(target_group)).id
+        start_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("▶️ Start Quiz Now", callback_data=f"start_quiz:{group_chat_id}"),
+                InlineKeyboardButton("⏳ Auto-Start (10s)", callback_data=f"autostart_info:{group_chat_id}")
+            ]
+        ])
+        intro_msg = await context.bot.send_message(
+            chat_id=target_group,
+            text=intro_card,
+            reply_markup=start_kb,
+            parse_mode="Markdown"
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to reach `{target_group}`: `{e}`\nCheck bot admin permissions and try again:")
         return
@@ -1483,10 +1534,11 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
     ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
         "mcqs": shuffled_mcqs,
         "current_index": 0,
-        "topic": topic
+        "topic": topic,
+        "start_event": asyncio.Event()
     }
 
-    asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context))
+    asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context, intro_msg.message_id))
 
 
 import random
@@ -1522,11 +1574,32 @@ POLL_LOOKUP: Dict[str, Dict[str, Any]] = {}
 
 
 # ----------------- TELEGRAM NATIVE QUIZ ENGINE (ALL-USER VOTING & RANKING) -----------------
-async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEFAULT_TYPE, intro_msg_id: Optional[int] = None):
     chat_key = str(group_chat_id)
     session = ACTIVE_GROUP_QUIZZES.get(chat_key)
     if not session:
         return
+
+    # 10s warmup countdown or immediate start on button press
+    start_event = session.get("start_event")
+    if start_event:
+        try:
+            await asyncio.wait_for(start_event.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            pass  # Auto-start after 10s warmup
+
+    # Update intro message button to show Quiz is in Progress
+    if intro_msg_id:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=group_chat_id,
+                message_id=intro_msg_id,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔥 Quiz in Progress...", callback_data="quiz_live")
+                ]])
+            )
+        except Exception:
+            pass
 
     mcqs = session["mcqs"]
     total_q = len(mcqs)
@@ -1729,6 +1802,24 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 session["scores"][user_id]["correct"] += 1
 
 
+async def handle_quiz_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+
+    if data.startswith("start_quiz:"):
+        group_id_str = data.split("start_quiz:")[1]
+        session = ACTIVE_GROUP_QUIZZES.get(group_id_str)
+        if session and session.get("start_event"):
+            session["start_event"].set()
+            await query.answer("🚀 Starting Quiz immediately!")
+        else:
+            await query.answer("Quiz is already active or completed.")
+    elif data.startswith("autostart_info:"):
+        await query.answer("⏳ Auto-starts in 10s! Or tap [▶️ Start Quiz Now] to begin immediately.", show_alert=True)
+    elif data == "quiz_live":
+        await query.answer("🔥 Quiz is currently live! Cast your vote on the active poll above.")
+
+
 # ----------------- MAIN INITIALIZATION -----------------
 def main():
     if not TELEGRAM_BOT_TOKEN:
@@ -1760,6 +1851,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_mock_selection, pattern=r"^mock_len:"))
     app.add_handler(CallbackQueryHandler(handle_subject_button_selection, pattern=r"^sub_sel:"))
     app.add_handler(CallbackQueryHandler(handle_admin_topic_choice, pattern=r"^adm_top:"))
+    app.add_handler(CallbackQueryHandler(handle_quiz_start_callback, pattern=r"^(start_quiz:|autostart_info:|quiz_live)"))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
 
     logger.info("Native QuizBot engine active with full group voting and leaderboard rankings.")
