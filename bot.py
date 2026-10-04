@@ -209,7 +209,19 @@ def clean_json_response(raw_text: str) -> List[Dict[str, Any]]:
         return json.loads(fixed_text)
 
 
+# Global Model Cache
+CACHED_WORKING_MODELS: List[str] = []
+PRIMARY_WORKING_MODEL: str = ""
+
+
 def get_available_gemini_models() -> List[str]:
+    global CACHED_WORKING_MODELS, PRIMARY_WORKING_MODEL
+    if PRIMARY_WORKING_MODEL:
+        return [PRIMARY_WORKING_MODEL] + [m for m in CACHED_WORKING_MODELS if m != PRIMARY_WORKING_MODEL]
+
+    if CACHED_WORKING_MODELS:
+        return CACHED_WORKING_MODELS
+
     valid = []
     if legacy_genai and GEMINI_API_KEY:
         try:
@@ -242,30 +254,28 @@ def get_available_gemini_models() -> List[str]:
             "gemini-1.5-flash-8b",
             "gemini-2.0-flash-exp"
         ]
+    CACHED_WORKING_MODELS = valid
     return valid
 
 
 # ----------------- GEMINI PDF QUESTION SYNTHESIS ENGINE -----------------
 def generate_questions_with_gemini(file_path: str) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
+    global PRIMARY_WORKING_MODEL
     if not GEMINI_API_KEY:
         return {}, "GEMINI_API_KEY is not configured in Render environment."
 
     prompt = """
-You are an advanced competitive exam question designer. Analyze this document completely (including Hindi and English text, current affairs, science, history, tables, and notes).
-Identify the main chapters/topics.
-
-CRITICAL INSTRUCTION:
-For EVERY detected chapter/topic, generate between 25 to 50 comprehensive, high-yield Multiple Choice Questions (MINIMUM 25 questions, MAXIMUM 50 questions per section). Cover all key points, facts, and concepts in depth.
+You are an advanced competitive exam question designer. Analyze this document completely.
+Generate between 25 to 50 comprehensive Multiple Choice Questions for each topic.
 
 For each question provide:
-- "topic": Topic / Chapter Name (in Hindi or English as in the document)
+- "topic": Topic / Chapter Name
 - "difficulty": "EASY" | "MEDIUM" | "HARD"
-- "q_type": "CONCEPTUAL" | "CURRENT-AFFAIRS" | "STATEMENT-BASED"
 - "question": High quality question text (max 280 chars)
-- "options": Array of exactly 4 options ["A", "B", "C", "D"] (each max 90 chars)
-- "correct_index": Integer (0 for A, 1 for B, 2 for C, 3 for D)
+- "options": Exactly 4 options ["A", "B", "C", "D"] (each max 90 chars)
+- "correct_index": Integer (0, 1, 2, 3)
 - "concept": Core fact or theoretical principle
-- "solution": In-depth step-by-step explanation
+- "solution": Step-by-step explanation
 - "pro_tip": Quick memory tip or key takeaway (max 180 chars)
 
 Return ONLY a valid JSON array of objects.
@@ -274,32 +284,22 @@ Return ONLY a valid JSON array of objects.
     candidate_models = get_available_gemini_models()
     errors_log = []
 
-    # Method 1: Try modern google-genai SDK
-    if genai_client:
+    # 1. Legacy google.generativeai SDK
+    if legacy_genai and GEMINI_API_KEY:
         try:
-            logger.info("Synthesizing questions using modern google-genai SDK...")
-            uploaded = genai_client.files.upload(file=file_path)
+            logger.info("Uploading PDF to Gemini for analysis...")
+            uploaded = legacy_genai.upload_file(file_path, mime_type="application/pdf")
             for _ in range(30):
-                f_state = genai_client.files.get(name=uploaded.name)
-                state_str = getattr(f_state, "state", "").upper() if hasattr(f_state, "state") else str(f_state.state)
-                if "ACTIVE" in state_str:
+                f_state = legacy_genai.get_file(uploaded.name)
+                state_name = getattr(f_state.state, "name", str(f_state.state))
+                if state_name == "ACTIVE":
                     break
-                time.sleep(3)
+                time.sleep(2)
 
             for m_name in candidate_models:
                 try:
-                    logger.info(f"Attempting generation with model: {m_name}")
-                    config = None
-                    if HAS_NEW_GENAI:
-                        config = new_genai_types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.4
-                        )
-                    response = genai_client.models.generate_content(
-                        model=m_name,
-                        contents=[uploaded, prompt],
-                        config=config
-                    )
+                    mod = legacy_genai.GenerativeModel(m_name)
+                    response = mod.generate_content([uploaded, prompt])
                     data = clean_json_response(response.text)
                     grouped: Dict[str, List[Dict[str, Any]]] = {}
                     for item in data:
@@ -308,6 +308,48 @@ Return ONLY a valid JSON array of objects.
                             grouped[t] = []
                         grouped[t].append(item)
                     if grouped:
+                        PRIMARY_WORKING_MODEL = m_name
+                        return grouped, ""
+                except Exception as leg_m_err:
+                    logger.warning(f"Legacy model {m_name} failed: {leg_m_err}")
+                    errors_log.append(f"Legacy {m_name}: {leg_m_err}")
+        except Exception as e:
+            logger.warning(f"Legacy genai error: {e}")
+            errors_log.append(f"Legacy SDK: {e}")
+
+    # 2. Modern google-genai SDK
+    if genai_client:
+        try:
+            uploaded = genai_client.files.upload(file=file_path)
+            for _ in range(30):
+                f_state = genai_client.files.get(name=uploaded.name)
+                state_str = getattr(f_state, "state", "").upper() if hasattr(f_state, "state") else str(f_state.state)
+                if "ACTIVE" in state_str:
+                    break
+                time.sleep(2)
+
+            for m_name in candidate_models:
+                try:
+                    config = None
+                    if HAS_NEW_GENAI:
+                        config = new_genai_types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.3
+                        )
+                    response = genai_client.models.generate_content(
+                        model=m_name,
+                        contents=[uploaded, prompt],
+                        config=config
+                    )
+                    data = clean_json_response(response.text)
+                    grouped = {}
+                    for item in data:
+                        t = item.get("topic", "General Section").strip()
+                        if t not in grouped:
+                            grouped[t] = []
+                        grouped[t].append(item)
+                    if grouped:
+                        PRIMARY_WORKING_MODEL = m_name
                         return grouped, ""
                 except Exception as m_err:
                     logger.warning(f"Model {m_name} failed: {m_err}")
@@ -317,41 +359,8 @@ Return ONLY a valid JSON array of objects.
             logger.warning(f"Modern genai error: {e}")
             errors_log.append(f"Modern SDK: {e}")
 
-    # Method 2: Try legacy google.generativeai SDK
-    if legacy_genai and GEMINI_API_KEY:
-        try:
-            logger.info("Synthesizing questions using legacy google.generativeai SDK...")
-            uploaded = legacy_genai.upload_file(file_path, mime_type="application/pdf")
-            for _ in range(30):
-                f_state = legacy_genai.get_file(uploaded.name)
-                state_name = getattr(f_state.state, "name", str(f_state.state))
-                if state_name == "ACTIVE":
-                    break
-                time.sleep(3)
-
-            for m_name in candidate_models:
-                try:
-                    mod = legacy_genai.GenerativeModel(m_name)
-                    response = mod.generate_content([uploaded, prompt])
-                    data = clean_json_response(response.text)
-                    grouped = {}
-                    for item in data:
-                        t = item.get("topic", "General Section").strip()
-                        if t not in grouped:
-                            grouped[t] = []
-                        grouped[t].append(item)
-                    if grouped:
-                        return grouped, ""
-                except Exception as leg_m_err:
-                    logger.warning(f"Legacy model {m_name} failed: {leg_m_err}")
-                    errors_log.append(f"Legacy {m_name}: {leg_m_err}")
-        except Exception as e:
-            logger.warning(f"Legacy genai error: {e}")
-            errors_log.append(f"Legacy SDK: {e}")
-
-    # Method 3: Local Text Page Chunking Fallback
+    # 3. Local Text Page Chunking Fallback
     try:
-        logger.info("Executing text chunk extraction fallback...")
         reader = pypdf.PdfReader(file_path)
         extracted = []
         for page in reader.pages[:40]:
@@ -384,6 +393,7 @@ Return ONLY a valid JSON array of objects.
                                 grouped[t] = []
                             grouped[t].append(item)
                         if grouped:
+                            PRIMARY_WORKING_MODEL = m_name
                             return grouped, ""
                 except Exception as fb_m_err:
                     logger.warning(f"Fallback model {m_name} failed: {fb_m_err}")
@@ -396,23 +406,22 @@ Return ONLY a valid JSON array of objects.
     return {}, last_err_text
 
 
-# ----------------- TOPIC-BASED ZERO-DOCUMENT GENERATOR (BATCHED) -----------------
+# ----------------- HIGH-SPEED PARALLEL TOPIC GENERATOR -----------------
 def generate_topic_batch(topic_name: str, batch_count: int, offset: int) -> Tuple[List[Dict[str, Any]], str]:
+    global PRIMARY_WORKING_MODEL
     prompt = f"""
-You are an expert exam paper creator for UP Super TET (उत्तर प्रदेश सुपर टीईटी) and state teacher recruitment examinations.
+You are an expert exam creator for UP Super TET and competitive exams.
 Topic: "{topic_name}"
 
-CRITICAL SPECIFICATION:
-Generate EXACTLY {batch_count} unique Multiple Choice Questions (MCQs) starting from question offset #{offset + 1} in Hindi (or bilingual for English subject).
-Ensure questions and options are concise so they fit Telegram's strict limits:
-- "question": Max 280 characters
-- "options": Exactly 4 options, each MAX 90 characters
-- "correct_index": Integer (0 for A, 1 for B, 2 for C, 3 for D)
-- "concept": Core theoretical principle / rule
-- "solution": Clear step-by-step pedagogical explanation
-- "pro_tip": Important exam trick / memory shortcut (max 180 chars)
+CRITICAL: Generate EXACTLY {batch_count} unique MCQs starting from #{offset + 1} in Hindi (or bilingual for English).
+- "question": Max 280 chars
+- "options": Exactly 4 options, each MAX 90 chars
+- "correct_index": Integer (0, 1, 2, 3)
+- "concept": Core rule
+- "solution": Pedagogical solution
+- "pro_tip": Key trick / rule (max 180 chars)
 
-Return ONLY a valid JSON array of {batch_count} objects with this format:
+Return ONLY a valid JSON array of {batch_count} objects:
 [
   {{
     "question": "प्रश्न...",
@@ -427,7 +436,7 @@ Return ONLY a valid JSON array of {batch_count} objects with this format:
     candidate_models = get_available_gemini_models()
     err_msgs = []
 
-    # 1. Try legacy google.generativeai SDK first
+    # 1. Fast direct call with legacy google.generativeai SDK
     if legacy_genai and GEMINI_API_KEY:
         for m_name in candidate_models:
             try:
@@ -436,12 +445,13 @@ Return ONLY a valid JSON array of {batch_count} objects with this format:
                 if resp and resp.text:
                     data = clean_json_response(resp.text)
                     if isinstance(data, list) and len(data) > 0:
+                        PRIMARY_WORKING_MODEL = m_name
                         return data, ""
             except Exception as e:
                 logger.warning(f"Legacy model {m_name} failed: {e}")
                 err_msgs.append(f"Legacy {m_name}: {e}")
 
-    # 2. Try modern google-genai SDK
+    # 2. Modern google-genai SDK
     if genai_client:
         for m_name in candidate_models:
             try:
@@ -459,6 +469,7 @@ Return ONLY a valid JSON array of {batch_count} objects with this format:
                 if resp and resp.text:
                     data = clean_json_response(resp.text)
                     if isinstance(data, list) and len(data) > 0:
+                        PRIMARY_WORKING_MODEL = m_name
                         return data, ""
             except Exception as e:
                 logger.warning(f"Modern model {m_name} failed: {e}")
@@ -469,40 +480,44 @@ Return ONLY a valid JSON array of {batch_count} objects with this format:
 
 
 def generate_custom_topic_mcqs(topic_name: str, count: int) -> Tuple[List[Dict[str, Any]], str]:
+    import concurrent.futures
     if not GEMINI_API_KEY:
         return [], "GEMINI_API_KEY is not configured in Render environment."
 
     count = max(5, min(count, 100))
-    all_mcqs: List[Dict[str, Any]] = []
-    
-    batch_size = 20
-    remaining = count
+
+    # Fast single batch for small counts
+    if count <= 25:
+        data, err = generate_topic_batch(topic_name, count, 0)
+        return data, err
+
+    # High-speed parallel generation for larger counts (25-100 questions)
+    batch_size = 25
+    tasks = []
     offset = 0
-    last_err = ""
+    remaining = count
 
     while remaining > 0:
-        current_batch_size = min(remaining, batch_size)
-        logger.info(f"Generating batch of {current_batch_size} questions for '{topic_name}'...")
-        batch_mcqs, err = generate_topic_batch(topic_name, current_batch_size, offset)
-        
-        if batch_mcqs:
-            all_mcqs.extend(batch_mcqs)
-            offset += len(batch_mcqs)
-            remaining -= len(batch_mcqs)
-        else:
-            last_err = err
-            if current_batch_size > 10:
-                current_batch_size = 10
-                batch_mcqs, err2 = generate_topic_batch(topic_name, current_batch_size, offset)
-                if batch_mcqs:
-                    all_mcqs.extend(batch_mcqs)
-                    offset += len(batch_mcqs)
-                    remaining -= len(batch_mcqs)
-                else:
-                    last_err = err2
-                    break
-            else:
-                break
+        c_size = min(remaining, batch_size)
+        tasks.append((topic_name, c_size, offset))
+        offset += c_size
+        remaining -= c_size
+
+    all_mcqs: List[Dict[str, Any]] = []
+    last_err = ""
+
+    # Execute all batches in parallel simultaneously (completes in 3-5 seconds!)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+        futures = [executor.submit(generate_topic_batch, t[0], t[1], t[2]) for t in tasks]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                batch_data, err = future.result()
+                if batch_data:
+                    all_mcqs.extend(batch_data)
+                elif err:
+                    last_err = err
+            except Exception as ex:
+                last_err = str(ex)
 
     if all_mcqs:
         return all_mcqs[:count], ""
