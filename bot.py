@@ -7,11 +7,13 @@ import asyncio
 import logging
 import threading
 import tempfile
-import urllib.request
 import re
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Any, List
 
+import gdown
+import requests
 import pypdf
 import google.generativeai as genai
 from telegram import (
@@ -100,26 +102,75 @@ def start_self_pinger():
             logger.warning(f"Self-ping failed: {e}")
 
 
-# ----------------- GEMINI FILE API (UNLIMITED SIZE UP TO 2GB) -----------------
+# ----------------- LARGE FILE DOWNLOADER (GOOGLE DRIVE & WEB) -----------------
+def download_large_file(url: str, output_path: str) -> bool:
+    """Handles large files including Google Drive virus scan bypass via gdown/requests."""
+    if "drive.google.com" in url or "drive.usercontent.google.com" in url:
+        logger.info(f"Downloading Google Drive file via gdown: {url}")
+        res = gdown.download(url=url, output=output_path, quiet=False, fuzzy=True)
+        if res and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            return True
+
+        # Fallback to direct requests session with confirm token
+        session = requests.Session()
+        drive_match = re.search(r"/d/([a-zA-Z0-9_-]+)", url) or re.search(r"id=([a-zA-Z0-9_-]+)", url)
+        if drive_match:
+            file_id = drive_match.group(1)
+            download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+            response = session.get(download_url, stream=True, timeout=60)
+            for k, v in response.cookies.items():
+                if k.startswith("download_warning"):
+                    download_url = f"https://drive.google.com/uc?export=download&confirm={v}&id={file_id}"
+                    response = session.get(download_url, stream=True, timeout=60)
+                    break
+
+            with open(output_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+
+    # Direct Web URL download
+    logger.info(f"Downloading direct URL: {url}")
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(output_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+    return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+
+
+# ----------------- GEMINI FILE API PROCESSOR (UP TO 2GB) -----------------
 def process_pdf_file_via_gemini(file_path: str) -> Dict[str, List[Dict[str, Any]]]:
-    """Uploads any size PDF directly to Gemini File API and synthesizes multi-topic questions."""
     if not gemini_model:
+        logger.error("Gemini model not initialized.")
         return {}
+
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    logger.info(f"Uploading file ({file_size_mb:.2f} MB) to Gemini File API...")
 
     uploaded_file = None
     try:
-        logger.info(f"Uploading {file_path} to Gemini File API...")
         uploaded_file = genai.upload_file(file_path, mime_type="application/pdf")
         
-        # Wait for file processing state if needed
-        time.sleep(2)
+        # Wait until file processing completes on Gemini's backend
+        for _ in range(30):
+            file_info = genai.get_file(uploaded_file.name)
+            state_name = getattr(file_info.state, "name", str(file_info.state))
+            logger.info(f"Gemini file state: {state_name}")
+            if state_name == "ACTIVE":
+                break
+            elif state_name == "FAILED":
+                raise Exception("Gemini backend failed to parse PDF document.")
+            time.sleep(3)
 
         prompt = """
 You are an advanced exam design intelligence. Analyze this full book/document completely (including Hindi and English text, tables, and chapters).
 Scan all major chapters/topics and synthesize high-quality modern competitive exam MCQs for each section.
 
 For each question provide:
-1. "topic": Specific Chapter or Topic Name (in the language of the document)
+1. "topic": Specific Chapter or Topic Name (in the language of the document, e.g. Current Affairs, Science, History)
 2. "difficulty": "EASY" | "MEDIUM" | "HARD"
 3. "q_type": "CONCEPTUAL" | "ASSERTION-REASON" | "STATEMENT-BASED" | "CURRENT-AFFAIRS"
 4. "question": High quality question in the same language as the book (Hindi or English)
@@ -158,8 +209,9 @@ Return ONLY a valid JSON array matching this exact schema:
                 grouped[t] = []
             grouped[t].append(item)
         return grouped
+
     except Exception as e:
-        logger.error(f"Gemini processing failure: {e}")
+        logger.error(f"Gemini processing error: {e}")
         return {}
     finally:
         if uploaded_file:
@@ -169,28 +221,7 @@ Return ONLY a valid JSON array matching this exact schema:
                 pass
 
 
-def download_file_from_url(url: str, output_path: str):
-    """Downloads large files from direct link or Google Drive link."""
-    # Convert standard Google Drive view link to direct download link
-    drive_match = re.search(r"/d/([a-zA-Z0-9_-]+)", url) or re.search(r"id=([a-zA-Z0-9_-]+)", url)
-    if "drive.google.com" in url and drive_match:
-        file_id = drive_match.group(1)
-        url = f"https://drive.google.com/uc?export=download&id={file_id}"
-
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    )
-    with urllib.request.urlopen(req, timeout=120) as response, open(output_path, "wb") as out_file:
-        chunk_size = 1024 * 1024  # 1MB chunks
-        while True:
-            chunk = response.read(chunk_size)
-            if not chunk:
-                break
-            out_file.write(chunk)
-
-
-# ----------------- ADMIN INTERFACE -----------------
+# ----------------- ADMIN HANDLERS -----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if update.effective_chat.type != "private":
@@ -204,10 +235,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "⚡ *AI Exam & PDF Quiz Engine*\n\n"
-        "📥 *Two Ways to Ingest Full Material:*\n"
+        "📥 *Two Ways to Ingest Material:*\n"
         "1. **Direct Upload**: Send any `.pdf` document up to 20 MB directly.\n"
-        "2. **Direct Link (Any Size: 100MB+, 500MB, Full Books)**: Paste a Google Drive or direct web link to the PDF.\n\n"
-        "👉 _Send a PDF file or paste a Link to start!_",
+        "2. **Google Drive Link (Any Size: 100MB+, 500MB, Full Books)**: Paste the Google Drive share link directly here!\n\n"
+        "👉 _Send a PDF file or paste your Google Drive link to start!_",
         parse_mode="Markdown"
     )
 
@@ -228,16 +259,14 @@ async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TY
 
     file_size_mb = (doc.file_size or 0) / (1024 * 1024)
 
-    # If > 20MB, Telegram blocks direct download
     if file_size_mb > 20.0:
         await update.message.reply_text(
             f"📦 *Large File Detected:* `{file_size_mb:.1f} MB`\n\n"
-            f"Telegram API blocks bot downloads over 20 MB.\n\n"
-            f"🚀 *Instant Solution (Upload Full 118MB Book at once):*\n"
+            f"Telegram API restricts bot downloads to 20 MB.\n\n"
+            f"🚀 *How to process this entire {file_size_mb:.0f}MB book:*\n"
             f"1. Upload the PDF to your **Google Drive**.\n"
-            f"2. Set sharing to *'Anyone with the link'*\n"
-            f"3. **Paste the Drive link right here in chat!**\n\n"
-            f"The bot will ingest the full book directly into Gemini AI with zero size limits.",
+            f"2. Right click $\\to$ **Share** $\\to$ Set to *'Anyone with the link'*.\n"
+            f"3. **Paste the Drive link right here in chat!**",
             parse_mode="Markdown"
         )
         return
@@ -268,38 +297,43 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = ADMIN_STATE.get(user_id, {})
     text = update.message.text.strip()
 
-    # If admin is in middle of providing group username
     if state.get("step") == "AWAITING_GROUP":
         await handle_admin_group_input(update, context)
         return
 
-    # Check if admin sent a URL / Google Drive link
     if text.startswith("http://") or text.startswith("https://"):
         if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
             await update.message.reply_text("⛔ Unauthorized.")
             return
 
-        status = await update.message.reply_text("⏳ *Step 1/3:* Fetching full document from link (Any size)...", parse_mode="Markdown")
+        status = await update.message.reply_text("⏳ *Step 1/3:* Fetching full document from Google Drive / Web...", parse_mode="Markdown")
         
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
             tmp_path = tmp_file.name
 
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(None, download_file_from_url, text, tmp_path)
+            success = await loop.run_in_executor(None, download_large_file, text, tmp_path)
+            if not success or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1000:
+                raise Exception("Downloaded file is empty or link requires permission.")
         except Exception as e:
             logger.error(f"URL download failure: {e}")
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-            await status.edit_text(f"❌ *Failed to download from link:* `{e}`\nEnsure link is publicly accessible.")
+            await status.edit_text(
+                f"❌ *Could not download from Google Drive:* `{e}`\n\n"
+                f"👉 Make sure Google Drive sharing is set to **'Anyone with the link'** (Viewer) and try pasting the link again.",
+                parse_mode="Markdown"
+            )
             return
 
+        file_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
+        await status.edit_text(f"✅ *Document Downloaded:* `{file_size_mb:.1f} MB`\n⏳ *Step 2/3:* Uploading to Gemini AI & parsing Hindi/English chapters...", parse_mode="Markdown")
         await process_and_prompt_topics(update, context, status, tmp_path)
 
 
 async def process_and_prompt_topics(update: Update, context: ContextTypes.DEFAULT_TYPE, status_msg, file_path: str):
     user_id = update.effective_user.id
-    await status_msg.edit_text("🧠 *Step 2/3:* Gemini AI reading full book & generating chapter questions...", parse_mode="Markdown")
 
     loop = asyncio.get_running_loop()
     try:
@@ -315,7 +349,7 @@ async def process_and_prompt_topics(update: Update, context: ContextTypes.DEFAUL
                 pass
 
     if not grouped:
-        await status_msg.edit_text("❌ *No questions extracted.* Ensure the document is not password protected and contains readable material.")
+        await status_msg.edit_text("❌ *No questions could be synthesized.* Ensure the PDF contains readable text/scans and try again.")
         return
 
     ADMIN_STATE[user_id] = {
@@ -331,7 +365,7 @@ async def process_and_prompt_topics(update: Update, context: ContextTypes.DEFAUL
         buttons.append([InlineKeyboardButton(f"📂 {t_name} • [{count} Qs]", callback_data=f"adm_top:{idx}")])
 
     await status_msg.edit_text(
-        f"🎯 *Full Document Analyzed!* Found {len(topics)} chapters/sections:\nChoose which topic to launch:",
+        f"🎯 *Full Document Analyzed!* Found {len(topics)} chapters/sections:\nChoose which topic to launch in your group:",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
@@ -406,7 +440,7 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
     asyncio.create_task(run_modern_group_quiz(group_chat_id, context))
 
 
-# ----------------- MODERN GROUP QUIZ ENGINE -----------------
+# ----------------- GROUP QUIZ ENGINE -----------------
 async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     chat_key = str(group_chat_id)
     session = ACTIVE_GROUP_QUIZZES.get(chat_key)
