@@ -222,7 +222,16 @@ Return ONLY a valid JSON array of objects.
 
     errors_log = []
 
-    candidate_models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-pro", "gemini-2.5-flash"]
+    # Dynamic model discovery + recommended target
+    candidate_models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash-8b", "gemini-1.5-flash"]
+
+    if genai_client:
+        try:
+            live_models = [m.name.replace("models/", "") for m in genai_client.models.list() if "generateContent" in str(getattr(m, "supported_generation_methods", []))]
+            if live_models:
+                candidate_models = live_models + [m for m in candidate_models if m not in live_models]
+        except Exception as e:
+            logger.warning(f"Could not fetch dynamic live models: {e}")
 
     # Method 1: Try modern google-genai SDK
     if genai_client:
