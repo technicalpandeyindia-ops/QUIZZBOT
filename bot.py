@@ -203,18 +203,21 @@ def generate_questions_with_gemini(file_path: str) -> Tuple[Dict[str, List[Dict[
 
     prompt = """
 You are an advanced competitive exam question designer. Analyze this document completely (including Hindi and English text, current affairs, science, history, tables, and notes).
-Identify the main chapters/topics and synthesize high-yield Multiple Choice Questions (MCQs) for each section.
+Identify the main chapters/topics.
+
+CRITICAL INSTRUCTION:
+For EVERY detected chapter/topic, generate between 25 to 50 comprehensive, high-yield Multiple Choice Questions (MINIMUM 25 questions, MAXIMUM 50 questions per section). Cover all key points, facts, and concepts in depth.
 
 For each question provide:
 - "topic": Topic / Chapter Name (in Hindi or English as in the document)
 - "difficulty": "EASY" | "MEDIUM" | "HARD"
 - "q_type": "CONCEPTUAL" | "CURRENT-AFFAIRS" | "STATEMENT-BASED"
-- "question": Question text
+- "question": High quality question text
 - "options": Array of exactly 4 options ["A", "B", "C", "D"]
 - "correct_index": Integer (0 for A, 1 for B, 2 for C, 3 for D)
 - "concept": Core fact or theoretical principle
-- "solution": In-depth explanation
-- "option_breakdown": Analysis of choices
+- "solution": In-depth step-by-step explanation
+- "option_breakdown": Detailed analysis of options
 - "pro_tip": Quick memory tip or key takeaway
 
 Return ONLY a valid JSON array of objects.
@@ -534,8 +537,8 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
             f"🚀 *LIVE ARENA: LIVE MCQ TEST*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📖 *Topic:* `{topic}`\n"
-            f"📊 *Questions:* `{len(mcqs)}`\n"
-            f"⏱️ *Timer:* 5 seconds to lock answer\n"
+            f"📊 *Questions:* `{len(mcqs)}` (Full Chapter Session)\n"
+            f"⏱️ *Voting Timer:* 10 SECONDS per question\n"
             f"💡 *Step-by-step solutions posted automatically*\n"
             f"🏆 *Live Leaderboard at completion*\n\n"
             f"👉 _First question incoming..._"
@@ -583,6 +586,7 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📌 *QUESTION {idx + 1}/{total_q}*  `[{progress_bar}]`\n"
             f"🏷️ `[{diff_badge}]` • `[{q_type}]`\n"
+            f"⏱️ *Voting Window: 10 Seconds*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"*{item['question']}*\n\n"
         )
@@ -595,7 +599,7 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
         for opt_idx in range(len(item["options"])):
             letter = chr(65 + opt_idx)
             cb = f"opt:{idx}:{opt_idx}"
-            row.append(InlineKeyboardButton(f"👉 {letter}", callback_data=cb))
+            row.append(InlineKeyboardButton(f"👉 Option {letter}", callback_data=cb))
             if len(row) == 2:
                 buttons.append(row)
                 row = []
@@ -610,7 +614,8 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
             parse_mode="Markdown"
         )
 
-        await asyncio.sleep(5)
+        # 10-Second Voting Window
+        await asyncio.sleep(10)
 
         correct_idx = item["correct_index"]
         correct_letter = chr(65 + correct_idx)
