@@ -354,6 +354,83 @@ Return ONLY a valid JSON array of objects.
     return {}, detailed_err
 
 
+# ----------------- TOPIC-BASED ZERO-DOCUMENT GENERATOR (UP SUPER TET PATTERN) -----------------
+def generate_custom_topic_mcqs(topic_name: str, count: int) -> Tuple[List[Dict[str, Any]], str]:
+    if not GEMINI_API_KEY:
+        return [], "GEMINI_API_KEY is not configured in Render environment."
+
+    count = max(5, min(count, 100))  # Bound between 5 and 100
+
+    prompt = f"""
+You are an expert examiner specializing in the latest UP Super TET (उत्तर प्रदेश सुपर टीईटी) and state teacher recruitment / competitive exams.
+Analyze the latest official syllabus, standard exam trends, difficulty levels, and question formats for the topic: "{topic_name}".
+
+CRITICAL SPECIFICATION:
+Generate EXACTLY {count} high-yield, exam-standard Multiple Choice Questions (MCQs) in Hindi (or bilingual if English subject) covering this topic thoroughly.
+
+Subject domains applicable:
+- Child Development & Pedagogy (बाल विकास एवं शिक्षण कौशल)
+- Hindi / Sanskrit / English Language & Grammar
+- Environmental & Social Studies (पर्यावरण एवं सामाजिक अध्ययन)
+- Science, Mathematics & Reasoning
+- General Knowledge & Current Affairs (सामान्य ज्ञान एवं समसामयिक घटनाएं)
+- Information Technology & Life Skills / Management Attitude (जीवन कौशल एवं प्रबंधन)
+
+For each question provide:
+- "question": High quality exam question text
+- "options": Array of exactly 4 options ["A", "B", "C", "D"]
+- "correct_index": Integer (0 for A, 1 for B, 2 for C, 3 for D)
+- "concept": Core concept / rule
+- "solution": Detailed pedagogical step-by-step solution
+- "pro_tip": Exam trick, memory tip, or key article/rule
+
+Return ONLY a valid JSON array of {count} objects matching this schema:
+[
+  {{
+    "question": "प्रश्न यहाँ लिखें...",
+    "options": ["विकल्प A", "विकल्प B", "विकल्प C", "विकल्प D"],
+    "correct_index": 0,
+    "concept": "मुख्य नियम",
+    "solution": "विस्तृत व्याख्या",
+    "pro_tip": "याद रखने योग्य तथ्य"
+  }}
+]
+"""
+
+    candidate_models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash-8b", "gemini-1.5-flash"]
+    
+    if genai_client:
+        for m_name in candidate_models:
+            try:
+                config = None
+                if HAS_NEW_GENAI:
+                    config = new_genai_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.3
+                    )
+                resp = genai_client.models.generate_content(
+                    model=m_name,
+                    contents=prompt,
+                    config=config
+                )
+                data = clean_json_response(resp.text)
+                if isinstance(data, list) and len(data) > 0:
+                    return data, ""
+            except Exception as e:
+                logger.warning(f"Topic generation model {m_name} failed: {e}")
+
+    if legacy_model:
+        try:
+            resp = legacy_model.generate_content(prompt)
+            data = clean_json_response(resp.text)
+            if isinstance(data, list) and len(data) > 0:
+                return data, ""
+        except Exception as e:
+            logger.warning(f"Legacy topic generation error: {e}")
+
+    return [], "Could not synthesize questions for this topic. Verify API key and network."
+
+
 # ----------------- ADMIN HANDLERS -----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -366,60 +443,46 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👋 Hello! Tests will run in your configured community group.")
         return
 
+    buttons = [
+        [InlineKeyboardButton("✍️ Create Quiz by Topic (No PDF Needed)", callback_data="mode_topic")],
+        [InlineKeyboardButton("📄 Upload PDF / Google Drive Link", callback_data="mode_pdf")]
+    ]
+
     await update.message.reply_text(
-        "⚡ *AI Exam & PDF Quiz Engine*\n\n"
-        "📥 *How to Ingest Material:*\n"
-        "1. **Direct Upload**: Send any `.pdf` document up to 20 MB directly.\n"
-        "2. **Google Drive Link (Any Size: 100MB+, 500MB, Full Books)**: Paste the Google Drive link directly here!\n\n"
-        "👉 _Send a PDF file or paste your Google Drive link to start!_",
+        "⚡ *AI Exam & Quiz Master (UP Super TET & All Exams)*\n\n"
+        "Choose how you want to create your quiz:\n\n"
+        "1️⃣ *Create by Topic (No PDF)*: Just give the topic name (e.g. `UP Super TET - Bal Vikas`), select question count, and launch!\n"
+        "2️⃣ *PDF / Cloud Ingest*: Send any PDF or Google Drive link for full book parsing.",
+        reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
 
 
-async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        return
+async def handle_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
     user_id = update.effective_user.id
-    if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
-        await update.message.reply_text("⛔ Unauthorized.")
-        return
+    data = query.data
 
-    doc = update.message.document
-    if not doc or not doc.file_name or not doc.file_name.lower().endswith(".pdf"):
-        await update.message.reply_text("❌ Please send a valid `.pdf` file.")
-        return
-
-    file_size_mb = (doc.file_size or 0) / (1024 * 1024)
-
-    if file_size_mb > 20.0:
-        await update.message.reply_text(
-            f"📦 *Large File Detected:* `{file_size_mb:.1f} MB`\n\n"
-            f"Telegram API restricts bot downloads to 20 MB.\n\n"
-            f"🚀 *How to process this entire {file_size_mb:.0f}MB book:*\n"
-            f"1. Upload the PDF to your **Google Drive**.\n"
-            f"2. Right click $\\to$ **Share** $\\to$ Set to *'Anyone with the link'*.\n"
-            f"3. **Paste the Drive link right here in chat!**",
+    if data == "mode_topic":
+        ADMIN_STATE[user_id] = {"step": "AWAITING_TOPIC_NAME"}
+        await query.edit_message_text(
+            "✍️ *Step 1/3: Enter Topic or Subject Name*\n\n"
+            "Examples:\n"
+            "• `UP Super TET - बाल विकास एवं शिक्षण शास्त्र`\n"
+            "• `UP Super TET - हिंदी व्याकरण एवं साहित्य`\n"
+            "• `पर्यावरण एवं सामाजिक अध्ययन (EVS)`\n"
+            "• `Current Affairs 2026`\n\n"
+            "👉 *Type and send your topic name here:*",
             parse_mode="Markdown"
         )
-        return
-
-    status = await update.message.reply_text(f"⏳ *Step 1/3:* Downloading PDF (`{file_size_mb:.1f} MB`)...", parse_mode="Markdown")
-
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
-        tmp_path = tmp_file.name
-
-    try:
-        file_obj = await context.bot.get_file(doc.file_id)
-        await file_obj.download_to_drive(custom_path=tmp_path)
-    except Exception as e:
-        logger.error(f"Download failure: {e}")
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        await status.edit_text(f"❌ *Download Error:* `{e}`")
-        return
-
-    await process_and_prompt_topics(update, context, status, tmp_path)
+    elif data == "mode_pdf":
+        ADMIN_STATE[user_id] = {"step": "AWAITING_PDF"}
+        await query.edit_message_text(
+            "📄 *Send your PDF document or paste a Google Drive link right here in chat!*",
+            parse_mode="Markdown"
+        )
 
 
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,11 +492,115 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = ADMIN_STATE.get(user_id, {})
     text = update.message.text.strip()
+    current_step = state.get("step")
 
-    if state.get("step") == "AWAITING_GROUP":
+    # Step: Admin providing topic name
+    if current_step == "AWAITING_TOPIC_NAME":
+        state["custom_topic"] = text
+        state["step"] = "AWAITING_QUESTION_COUNT"
+        await update.message.reply_text(
+            f"🎯 *Topic Selected:* `{text}`\n\n"
+            f"🔢 *Step 2/3: How many questions do you want to generate?*\n"
+            f"Examples: `10`, `25`, `30`, `50`, `75`\n\n"
+            f"👉 *Send the number of questions:*",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Step: Admin providing question count
+    if current_step == "AWAITING_QUESTION_COUNT":
+        if not text.isdigit() or int(text) < 1:
+            await update.message.reply_text("❌ Please enter a valid positive number (e.g. `25` or `50`):")
+            return
+
+        count = int(text)
+        state["q_count"] = count
+        state["step"] = "AWAITING_TOPIC_GROUP"
+        await update.message.reply_text(
+            f"📊 *Questions to Generate:* `{count}`\n\n"
+            f"📢 *Step 3/3: Send target Group Username or ID:*\n"
+            f"Examples: `@myquizgroup` or `-1001234567890`\n\n"
+            f"*(Ensure bot is an Admin in the group)*",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Step: Admin providing group for topic quiz
+    if current_step == "AWAITING_TOPIC_GROUP":
+        target_group = text
+        topic = state.get("custom_topic", "General Section")
+        q_count = state.get("q_count", 25)
+
+        status_msg = await update.message.reply_text(
+            f"🧠 Generating `{q_count}` questions on *{topic}* based on latest UP Super TET exam pattern with Gemini AI...",
+            parse_mode="Markdown"
+        )
+
+        loop = asyncio.get_running_loop()
+        mcqs, err = await loop.run_in_executor(None, generate_custom_topic_mcqs, topic, q_count)
+
+        if not mcqs:
+            await status_msg.edit_text(f"❌ *Synthesis Failed:* `{err}`\nTry running again with `/start`.")
+            return
+
+        try:
+            intro_card = (
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📋 *Exam Target:* `UP Super TET / Competitive`\n"
+                f"📖 *Topic:* `{topic}`\n"
+                f"📊 *Questions:* `{len(mcqs)}`\n"
+                f"⏱️ *Timer:* `15s per question`\n"
+                f"✅ *Correct mark:* `+1.0`\n"
+                f"➖ *Negative:* `None`\n"
+                f"🔀 *Shuffle Q:* ❌ | *Options:* ❌\n"
+                f"💡 *Show explanation:* ✅ Yes\n"
+                f"🛡️ *Anti-Cheat:* ❌ Off\n"
+                f"📢 *Promo messages enabled*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🚀 *Starting now — good luck!*"
+            )
+            await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
+            group_chat_id = (await context.bot.get_chat(target_group)).id
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Failed to reach `{target_group}`: `{e}`\nCheck bot admin permissions and try again.")
+            return
+
+        state["step"] = "LAUNCHED"
+        await status_msg.edit_text(f"🔥 *Quiz on `{topic}` ({len(mcqs)} Questions) live in* `{target_group}`!", parse_mode="Markdown")
+
+        ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
+            "mcqs": mcqs,
+            "current_index": 0,
+            "topic": topic,
+            "scores": {}
+        }
+
+        asyncio.create_task(run_native_quiz_polls(group_chat_id, context))
+        return
+
+    # PDF Question Count Step
+    if current_step == "AWAITING_PDF_Q_COUNT":
+        if not text.isdigit() or int(text) < 1:
+            await update.message.reply_text("❌ Please enter a valid number of questions (e.g. `25` or `50`):")
+            return
+
+        state["pdf_q_count"] = int(text)
+        state["step"] = "AWAITING_GROUP"
+        await update.message.reply_text(
+            f"📊 *Questions to Test:* `{state['pdf_q_count']}`\n\n"
+            f"📢 *Now send target Group Username or ID:*\n"
+            f"Examples: `@myquizgroup` or `-1001234567890`\n\n"
+            f"*(Ensure bot is an Admin in the group)*",
+            parse_mode="Markdown"
+        )
+        return
+
+    # PDF Group Dispatcher Step
+    if current_step == "AWAITING_GROUP":
         await handle_admin_group_input(update, context)
         return
 
+    # Direct Web URL / Google Drive link
     if text.startswith("http://") or text.startswith("https://"):
         if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
             await update.message.reply_text("⛔ Unauthorized.")
@@ -522,12 +689,13 @@ async def handle_admin_topic_choice(update: Update, context: ContextTypes.DEFAUL
 
     chosen_topic = topics[topic_idx]
     state["selected_topic"] = chosen_topic
-    state["step"] = "AWAITING_GROUP"
+    state["step"] = "AWAITING_PDF_Q_COUNT"
 
     await query.edit_message_text(
-        f"🏷️ *Selected Topic:* `{chosen_topic}`\n\n"
-        f"📢 *Send target group username or ID:*\n"
-        f"Examples: `@myquizgroup` or `-1001234567890`",
+        f"🏷️ *Selected Section:* `{chosen_topic}`\n\n"
+        f"🔢 *How many questions do you want to test from this section?*\n"
+        f"Examples: `10`, `25`, `30`, `50`, `75`\n\n"
+        f"👉 *Send the number of questions:*",
         parse_mode="Markdown"
     )
 
@@ -541,11 +709,17 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
     target_group = update.message.text.strip()
     topic = state["selected_topic"]
     mcqs = state["topics_data"][topic]
+    
+    # Apply requested question count if specified
+    requested_count = state.get("pdf_q_count", len(mcqs))
+    if requested_count < len(mcqs):
+        mcqs = mcqs[:requested_count]
 
     try:
         intro_card = (
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 *Questions:* `{len(mcqs)}`\n"
+            f"📋 *Section / Chapter:* `{topic}`\n"
+            f"📊 *Questions:* `{len(mcqs)}`\n"
             f"⏱️ *Timer:* `15s per question`\n"
             f"✅ *Correct mark:* `+1.0`\n"
             f"➖ *Negative:* `None`\n"
@@ -563,7 +737,7 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
         return
 
     state["step"] = "LAUNCHED"
-    await update.message.reply_text(f"🔥 *Quiz initiated in* `{target_group}`!", parse_mode="Markdown")
+    await update.message.reply_text(f"🔥 *Quiz on `{topic}` ({len(mcqs)} Questions) initiated in* `{target_group}`!", parse_mode="Markdown")
 
     ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
         "mcqs": mcqs,
@@ -710,6 +884,7 @@ def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_admin_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_admin_text))
+    app.add_handler(CallbackQueryHandler(handle_mode_callback, pattern=r"^mode_"))
     app.add_handler(CallbackQueryHandler(handle_admin_topic_choice, pattern=r"^adm_top:"))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
 
