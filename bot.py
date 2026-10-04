@@ -1148,7 +1148,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📋 *Exam Target:* `UP Super TET / Competitive`\n"
                 f"🎥 *YouTube Source:* `{video_title[:45]}`\n"
                 f"📊 *Questions:* `{len(mcqs)}`\n"
-                f"⏱️ *Timer:* `15s per question`\n"
+                f"⏱️ *Timer:* `25s per question`\n"
                 f"✅ *Correct mark:* `+1.0`\n"
                 f"➖ *Negative:* `None`\n"
                 f"👥 *Voting:* `Open for ALL group members`\n"
@@ -1215,7 +1215,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📋 *Exam Target:* `UP Super TET Full Model Paper (संपूर्ण मॉडल पेपर)`\n"
                 f"📚 *Coverage:* `All 14 Subjects (Hindi, Sanskrit, Eng, Sci, Math, EV, CDP, Teaching Skills, GK/CA, Reasoning, IT, Life Skills)`\n"
                 f"📊 *Questions:* `{len(mcqs)}`\n"
-                f"⏱️ *Timer:* `15s per question`\n"
+                f"⏱️ *Timer:* `25s per question`\n"
                 f"✅ *Correct mark:* `+1.0`\n"
                 f"➖ *Negative:* `None`\n"
                 f"👥 *Voting:* `Open for ALL group members`\n"
@@ -1296,7 +1296,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📋 *Exam Target:* `UP Super TET / Competitive`\n"
                 f"📖 *Topic:* `{topic}`\n"
                 f"📊 *Questions:* `{len(mcqs)}`\n"
-                f"⏱️ *Timer:* `15s per question`\n"
+                f"⏱️ *Timer:* `25s per question`\n"
                 f"✅ *Correct mark:* `+1.0`\n"
                 f"➖ *Negative:* `None`\n"
                 f"👥 *Voting:* `Open for ALL group members`\n"
@@ -1463,7 +1463,7 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📋 *Section / Chapter:* `{topic}`\n"
             f"📊 *Questions:* `{len(mcqs)}`\n"
-            f"⏱️ *Timer:* `15s per question`\n"
+            f"⏱️ *Timer:* `25s per question`\n"
             f"✅ *Correct mark:* `+1.0`\n"
             f"➖ *Negative:* `None`\n"
             f"👥 *Voting:* `Open for ALL group members`\n"
@@ -1540,11 +1540,21 @@ async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEF
         if len(q_title) > 295:
             q_title = q_title[:292] + "..."
 
-        # Options (strictly max 95 characters per Telegram limit)
+        # Deduplicate and format options (strictly max 95 characters per Telegram limit)
         raw_options = item.get("options", [])
-        options = [str(opt).strip()[:95] for opt in raw_options if str(opt).strip()]
+        options = []
+        seen = set()
+        for opt in raw_options:
+            s_opt = str(opt).strip()[:95]
+            if not s_opt:
+                continue
+            if s_opt in seen:
+                s_opt = f"{s_opt}."
+            seen.add(s_opt)
+            options.append(s_opt)
+
         if len(options) < 2:
-            options = ["विकल्प A", "विकल्प B", "विकल्प C", "विकल्प D"]
+            options = ["(A) विकल्प 1", "(B) विकल्प 2", "(C) विकल्प 3", "(D) विकल्प 4"]
 
         correct_id = int(item.get("correct_index", 0))
         if correct_id < 0 or correct_id >= len(options):
@@ -1552,13 +1562,13 @@ async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEF
 
         # Explanation shown natively when user taps wrong or taps lightbulb 💡
         explanation = item.get("pro_tip", "") or item.get("concept", "") or item.get("solution", "")
-        explanation = explanation.strip()
+        explanation = explanation.strip().replace("`", "").replace("*", "")
         if len(explanation) > 195:
             explanation = explanation[:192] + "..."
 
         poll_msg = None
+        # Attempt non-anonymous quiz poll with 25s timer
         try:
-            # is_anonymous=False enables live voter tracking and leaderboard ranking
             poll_msg = await context.bot.send_poll(
                 chat_id=group_chat_id,
                 question=q_title,
@@ -1567,15 +1577,10 @@ async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEF
                 correct_option_id=correct_id,
                 explanation=explanation if explanation else None,
                 is_anonymous=False,
-                open_period=15  # 15s visual countdown ring
+                open_period=25
             )
-            if poll_msg and poll_msg.poll:
-                POLL_LOOKUP[poll_msg.poll.id] = {
-                    "chat_key": chat_key,
-                    "correct_id": correct_id
-                }
-        except Exception as poll_err:
-            logger.error(f"Poll dispatch error: {poll_err}")
+        except Exception as p_err1:
+            logger.warning(f"Poll attempt 1 failed: {p_err1}")
             try:
                 poll_msg = await context.bot.send_poll(
                     chat_id=group_chat_id,
@@ -1584,18 +1589,41 @@ async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEF
                     type="quiz",
                     correct_option_id=correct_id,
                     is_anonymous=False,
-                    open_period=15
+                    open_period=25
                 )
-                if poll_msg and poll_msg.poll:
-                    POLL_LOOKUP[poll_msg.poll.id] = {
-                        "chat_key": chat_key,
-                        "correct_id": correct_id
-                    }
-            except Exception as fb_err:
-                logger.error(f"Secondary poll fallback failed: {fb_err}")
+            except Exception as p_err2:
+                logger.warning(f"Poll attempt 2 failed: {p_err2}")
+                try:
+                    poll_msg = await context.bot.send_poll(
+                        chat_id=group_chat_id,
+                        question=q_title,
+                        options=options,
+                        type="quiz",
+                        correct_option_id=correct_id,
+                        is_anonymous=False
+                    )
+                except Exception as p_err3:
+                    logger.warning(f"Poll attempt 3 failed: {p_err3}")
+                    try:
+                        poll_msg = await context.bot.send_poll(
+                            chat_id=group_chat_id,
+                            question=q_title,
+                            options=options,
+                            type="quiz",
+                            correct_option_id=correct_id,
+                            is_anonymous=True
+                        )
+                    except Exception as fb_err:
+                        logger.error(f"All poll dispatch fallbacks failed: {fb_err}")
 
-        # 1. Wait for 15-second voting period to complete
-        await asyncio.sleep(15)
+        if poll_msg and poll_msg.poll:
+            POLL_LOOKUP[poll_msg.poll.id] = {
+                "chat_key": chat_key,
+                "correct_id": correct_id
+            }
+
+        # 1. Wait for 25-second voting period to allow all group members to choose their option
+        await asyncio.sleep(25)
 
         # 2. Post the Clean Solution Card
         full_solution = item.get("solution", "") or item.get("concept", "No additional notes.")
