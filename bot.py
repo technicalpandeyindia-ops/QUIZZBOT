@@ -251,9 +251,16 @@ Return ONLY a valid JSON array of objects.
             for m_name in candidate_models:
                 try:
                     logger.info(f"Attempting generation with model: {m_name}")
+                    config = None
+                    if HAS_NEW_GENAI:
+                        config = new_genai_types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.4
+                        )
                     response = genai_client.models.generate_content(
                         model=m_name,
-                        contents=[uploaded, prompt]
+                        contents=[uploaded, prompt],
+                        config=config
                     )
                     data = clean_json_response(response.text)
                     grouped: Dict[str, List[Dict[str, Any]]] = {}
