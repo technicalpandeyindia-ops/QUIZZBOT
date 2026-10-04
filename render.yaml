@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: telegram-mcq-quiz-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ADMIN_USER_ID
+        sync: false
+      - key: PORT
+        value: 8080
+      - key: SELF_PING_URL
+        sync: false
