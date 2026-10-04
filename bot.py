@@ -15,7 +15,17 @@ from typing import Dict, Any, List, Tuple
 import gdown
 import requests
 import pypdf
-import google.generativeai as genai
+
+# Dual SDK Support: Modern google-genai + google.generativeai
+try:
+    from google import genai as new_genai
+    from google.genai import types as new_genai_types
+    HAS_NEW_GENAI = True
+except ImportError:
+    HAS_NEW_GENAI = False
+
+import google.generativeai as legacy_genai
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -45,15 +55,26 @@ logger = logging.getLogger(__name__)
 
 START_TIME = time.time()
 
+# Initialize Gemini Client (Supports both AQ... and AIzaSy... keys)
+genai_client = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel(
-        "gemini-1.5-flash",
-        generation_config={"temperature": 0.4, "max_output_tokens": 8192}
-    )
+    if HAS_NEW_GENAI:
+        try:
+            genai_client = new_genai.Client(api_key=GEMINI_API_KEY)
+            logger.info("Initialized modern google-genai client.")
+        except Exception as e:
+            logger.warning(f"Could not init modern genai client: {e}")
+    
+    try:
+        legacy_genai.configure(api_key=GEMINI_API_KEY)
+        legacy_model = legacy_genai.GenerativeModel("gemini-1.5-flash")
+        logger.info("Configured legacy google.generativeai.")
+    except Exception as e:
+        logger.warning(f"Legacy genai init error: {e}")
+        legacy_model = None
 else:
     logger.warning("GEMINI_API_KEY is not set!")
-    gemini_model = None
+    legacy_model = None
 
 # Session storage
 ADMIN_STATE: Dict[int, Dict[str, Any]] = {}
@@ -111,7 +132,6 @@ def download_large_file(url: str, output_path: str) -> bool:
         drive_match = re.search(r"/d/([a-zA-Z0-9_-]+)", url) or re.search(r"id=([a-zA-Z0-9_-]+)", url)
         file_id = drive_match.group(1) if drive_match else None
 
-        # 1. Try gdown
         try:
             if file_id:
                 res = gdown.download(id=file_id, output=output_path, quiet=False)
@@ -122,7 +142,6 @@ def download_large_file(url: str, output_path: str) -> bool:
         except Exception as e:
             logger.warning(f"gdown error: {e}, falling back to requests session...")
 
-        # 2. Fallback to requests Session
         if file_id:
             session = requests.Session()
             download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
@@ -150,7 +169,6 @@ def download_large_file(url: str, output_path: str) -> bool:
 
             return os.path.exists(output_path) and os.path.getsize(output_path) > 10000
 
-    # Direct URL
     with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(output_path, "wb") as f:
@@ -161,7 +179,6 @@ def download_large_file(url: str, output_path: str) -> bool:
 
 
 def clean_json_response(raw_text: str) -> List[Dict[str, Any]]:
-    """Strips markdown fences and safely parses JSON arrays."""
     text = raw_text.strip()
     if text.startswith("```json"):
         text = text[7:]
@@ -171,7 +188,6 @@ def clean_json_response(raw_text: str) -> List[Dict[str, Any]]:
         text = text[:-3]
     text = text.strip()
 
-    # Find start and end brackets
     start = text.find("[")
     end = text.rfind("]")
     if start != -1 and end != -1:
@@ -180,113 +196,117 @@ def clean_json_response(raw_text: str) -> List[Dict[str, Any]]:
     return json.loads(text)
 
 
-# ----------------- GEMINI MULTIMODAL & OCR ENGINE -----------------
-def process_pdf_file_via_gemini(file_path: str) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
-    """Uploads file to Gemini File API and extracts chapter-wise MCQs with full error tracing."""
-    if not gemini_model:
-        return {}, "Gemini API key is not configured in bot settings."
+# ----------------- GEMINI QUESTION SYNTHESIS ENGINE -----------------
+def generate_questions_with_gemini(file_path: str) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
+    if not GEMINI_API_KEY:
+        return {}, "GEMINI_API_KEY is not configured in Render environment."
 
-    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-    logger.info(f"Processing PDF ({file_size_mb:.2f} MB)...")
-
-    uploaded_file = None
-    try:
-        uploaded_file = genai.upload_file(file_path, mime_type="application/pdf")
-        
-        # Wait until file state is ACTIVE
-        for attempt in range(40):
-            file_info = genai.get_file(uploaded_file.name)
-            state_name = getattr(file_info.state, "name", str(file_info.state))
-            logger.info(f"Gemini file state (attempt {attempt}): {state_name}")
-            if state_name == "ACTIVE":
-                break
-            elif state_name == "FAILED":
-                return {}, "Gemini backend could not parse this PDF format."
-            time.sleep(3)
-
-        prompt = """
-You are an expert exam designer. Analyze this book/document (in Hindi and/or English).
-Identify the main topics/chapters and generate high-yield Multiple Choice Questions (MCQs) for each section.
+    prompt = """
+You are an advanced competitive exam question designer. Analyze this document completely (including Hindi and English text, current affairs, science, history, tables, and notes).
+Identify the main chapters/topics and synthesize high-yield Multiple Choice Questions (MCQs) for each section.
 
 For each question provide:
-- "topic": Topic / Chapter Name (in Hindi or English as per document)
+- "topic": Topic / Chapter Name (in Hindi or English as in the document)
 - "difficulty": "EASY" | "MEDIUM" | "HARD"
 - "q_type": "CONCEPTUAL" | "CURRENT-AFFAIRS" | "STATEMENT-BASED"
 - "question": Question text
-- "options": Array of 4 options ["A", "B", "C", "D"]
+- "options": Array of exactly 4 options ["A", "B", "C", "D"]
 - "correct_index": Integer (0 for A, 1 for B, 2 for C, 3 for D)
-- "concept": Core concept / key rule
-- "solution": Complete explanation
-- "option_breakdown": Brief explanation of options
-- "pro_tip": Quick memory tip or fact check
+- "concept": Core fact or theoretical principle
+- "solution": In-depth explanation
+- "option_breakdown": Analysis of choices
+- "pro_tip": Quick memory tip or key takeaway
 
-Output ONLY a valid JSON array of objects. Example:
-[
-  {
-    "topic": "National Affairs (राष्ट्रीय घटनाक्रम)",
-    "difficulty": "MEDIUM",
-    "q_type": "CURRENT-AFFAIRS",
-    "question": "प्रश्न यहाँ लिखें...",
-    "options": ["विकल्प A", "विकल्प B", "विकल्प C", "विकल्प D"],
-    "correct_index": 0,
-    "concept": "मुख्य बिंदु",
-    "solution": "विस्तृत व्याख्या",
-    "option_breakdown": "विकल्प विश्लेषण",
-    "pro_tip": "याद रखने योग्य तथ्य"
-  }
-]
+Return ONLY a valid JSON array of objects.
 """
-        response = gemini_model.generate_content([uploaded_file, prompt])
-        data = clean_json_response(response.text)
 
-        grouped: Dict[str, List[Dict[str, Any]]] = {}
-        for item in data:
-            t = item.get("topic", "General Section").strip()
-            if t not in grouped:
-                grouped[t] = []
-            grouped[t].append(item)
-
-        if not grouped:
-            return {}, "No structured questions found in Gemini response."
-
-        return grouped, ""
-
-    except Exception as e:
-        logger.error(f"Gemini API Exception: {e}", exc_info=True)
-        # Fallback: Extract text from local pages if API direct file processing hits parsing glitch
+    # Method 1: Try modern google-genai SDK
+    if genai_client:
         try:
-            logger.info("Attempting local text extraction fallback...")
-            reader = pypdf.PdfReader(file_path)
-            extracted_pages = []
-            for page in reader.pages[:50]:
-                txt = page.extract_text()
-                if txt:
-                    extracted_pages.append(txt)
-            raw_text = "\n".join(extracted_pages)[:35000]
+            logger.info("Synthesizing questions using modern google-genai SDK...")
+            # Upload file
+            uploaded = genai_client.files.upload(file=file_path)
+            for _ in range(30):
+                f_state = genai_client.files.get(name=uploaded.name)
+                state_str = getattr(f_state, "state", "").upper() if hasattr(f_state, "state") else str(f_state.state)
+                if "ACTIVE" in state_str:
+                    break
+                time.sleep(3)
 
-            if raw_text.strip():
-                fallback_prompt = prompt + f"\n\nContent Excerpt:\n{raw_text}"
-                resp2 = gemini_model.generate_content(fallback_prompt)
-                data2 = clean_json_response(resp2.text)
-                grouped2: Dict[str, List[Dict[str, Any]]] = {}
-                for item in data2:
-                    t = item.get("topic", "General Section").strip()
-                    if t not in grouped2:
-                        grouped2[t] = []
-                    grouped2[t].append(item)
-                if grouped2:
-                    return grouped2, ""
-        except Exception as fallback_err:
-            logger.error(f"Fallback error: {fallback_err}")
+            response = genai_client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=[uploaded, prompt]
+            )
+            data = clean_json_response(response.text)
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for item in data:
+                t = item.get("topic", "General Section").strip()
+                if t not in grouped:
+                    grouped[t] = []
+                grouped[t].append(item)
+            if grouped:
+                return grouped, ""
+        except Exception as e:
+            logger.warning(f"Modern genai SDK call error: {e}")
 
-        return {}, str(e)
+    # Method 2: Try legacy google.generativeai SDK
+    if legacy_model:
+        try:
+            logger.info("Synthesizing questions using legacy google.generativeai SDK...")
+            uploaded = legacy_genai.upload_file(file_path, mime_type="application/pdf")
+            for _ in range(30):
+                f_state = legacy_genai.get_file(uploaded.name)
+                state_name = getattr(f_state.state, "name", str(f_state.state))
+                if state_name == "ACTIVE":
+                    break
+                time.sleep(3)
 
-    finally:
-        if uploaded_file:
-            try:
-                genai.delete_file(uploaded_file.name)
-            except Exception:
-                pass
+            response = legacy_model.generate_content([uploaded, prompt])
+            data = clean_json_response(response.text)
+            grouped = {}
+            for item in data:
+                t = item.get("topic", "General Section").strip()
+                if t not in grouped:
+                    grouped[t] = []
+                grouped[t].append(item)
+            if grouped:
+                return grouped, ""
+        except Exception as e:
+            logger.warning(f"Legacy genai upload error: {e}")
+
+    # Method 3: Local Text Page Chunking Fallback
+    try:
+        logger.info("Executing text chunk extraction fallback...")
+        reader = pypdf.PdfReader(file_path)
+        extracted = []
+        for page in reader.pages[:40]:
+            txt = page.extract_text()
+            if txt:
+                extracted.append(txt)
+        raw_text = "\n".join(extracted)[:35000]
+
+        if raw_text.strip():
+            fallback_prompt = prompt + f"\n\nContent:\n{raw_text}"
+            if genai_client:
+                resp = genai_client.models.generate_content(
+                    model="gemini-1.5-flash",
+                    contents=fallback_prompt
+                )
+            else:
+                resp = legacy_model.generate_content(fallback_prompt)
+            data = clean_json_response(resp.text)
+            grouped = {}
+            for item in data:
+                t = item.get("topic", "General Section").strip()
+                if t not in grouped:
+                    grouped[t] = []
+                grouped[t].append(item)
+            if grouped:
+                return grouped, ""
+    except Exception as e:
+        logger.error(f"Fallback extraction error: {e}")
+
+    return {}, "Could not authenticate or parse document with current GEMINI_API_KEY. Ensure your key has Generative Language API enabled."
 
 
 # ----------------- ADMIN HANDLERS -----------------
@@ -298,7 +318,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     is_admin = (user_id == ADMIN_USER_ID or ADMIN_USER_ID == 0)
     if not is_admin:
-        await update.message.reply_text("👋 Hello! Quizzes will run in your configured community group.")
+        await update.message.reply_text("👋 Hello! Tests will run in your configured community group.")
         return
 
     await update.message.reply_text(
@@ -404,7 +424,7 @@ async def process_and_prompt_topics(update: Update, context: ContextTypes.DEFAUL
     user_id = update.effective_user.id
 
     loop = asyncio.get_running_loop()
-    grouped, error_msg = await loop.run_in_executor(None, process_pdf_file_via_gemini, file_path)
+    grouped, error_msg = await loop.run_in_executor(None, generate_questions_with_gemini, file_path)
 
     if os.path.exists(file_path):
         try:
@@ -415,10 +435,8 @@ async def process_and_prompt_topics(update: Update, context: ContextTypes.DEFAUL
     if not grouped:
         await status_msg.edit_text(
             f"❌ *AI Question Generation Failed*\n\n"
-            f"**Error Details:** `{error_msg}`\n\n"
-            f"💡 *Tips:*\n"
-            f"• Make sure `GEMINI_API_KEY` is valid and active in your Render environment variables.\n"
-            f"• If the file is extremely large, try sending a 10-30 page chapter or verify the PDF is readable.",
+            f"**Details:** `{error_msg}`\n\n"
+            f"👉 Make sure GEMINI_API_KEY is saved in your Render Environment Variables.",
             parse_mode="Markdown"
         )
         return
