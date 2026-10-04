@@ -102,35 +102,54 @@ def start_self_pinger():
             logger.warning(f"Self-ping failed: {e}")
 
 
-# ----------------- LARGE FILE DOWNLOADER (GOOGLE DRIVE & WEB) -----------------
+# ----------------- ROBUST GOOGLE DRIVE & WEB DOWNLOADER -----------------
 def download_large_file(url: str, output_path: str) -> bool:
-    """Handles large files including Google Drive virus scan bypass via gdown/requests."""
+    """Robust download supporting 100MB+ Google Drive files with confirmation tokens."""
     if "drive.google.com" in url or "drive.usercontent.google.com" in url:
-        logger.info(f"Downloading Google Drive file via gdown: {url}")
-        res = gdown.download(url=url, output=output_path, quiet=False, fuzzy=True)
-        if res and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-            return True
-
-        # Fallback to direct requests session with confirm token
-        session = requests.Session()
         drive_match = re.search(r"/d/([a-zA-Z0-9_-]+)", url) or re.search(r"id=([a-zA-Z0-9_-]+)", url)
-        if drive_match:
-            file_id = drive_match.group(1)
+        file_id = drive_match.group(1) if drive_match else None
+
+        # 1. Try gdown with standard signature
+        try:
+            if file_id:
+                res = gdown.download(id=file_id, output=output_path, quiet=False)
+            else:
+                res = gdown.download(url=url, output=output_path, quiet=False)
+            if res and os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
+                return True
+        except Exception as e:
+            logger.warning(f"gdown error: {e}, falling back to direct requests session...")
+
+        # 2. Direct requests session with cookie confirmation bypass
+        if file_id:
+            session = requests.Session()
             download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
             response = session.get(download_url, stream=True, timeout=60)
+            
+            token = None
             for k, v in response.cookies.items():
                 if k.startswith("download_warning"):
-                    download_url = f"https://drive.google.com/uc?export=download&confirm={v}&id={file_id}"
-                    response = session.get(download_url, stream=True, timeout=60)
+                    token = v
                     break
+            
+            # Check for HTML confirmation token in text if cookies didn't carry it
+            if not token and "confirm=" in response.text:
+                match = re.search(r"confirm=([a-zA-Z0-9_-]+)", response.text)
+                if match:
+                    token = match.group(1)
+
+            if token:
+                download_url = f"https://drive.google.com/uc?export=download&confirm={token}&id={file_id}"
+                response = session.get(download_url, stream=True, timeout=120)
 
             with open(output_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
-            return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
 
-    # Direct Web URL download
+            return os.path.exists(output_path) and os.path.getsize(output_path) > 10000
+
+    # Generic direct Web URL
     logger.info(f"Downloading direct URL: {url}")
     with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
@@ -138,7 +157,7 @@ def download_large_file(url: str, output_path: str) -> bool:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
-    return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+    return os.path.exists(output_path) and os.path.getsize(output_path) > 10000
 
 
 # ----------------- GEMINI FILE API PROCESSOR (UP TO 2GB) -----------------
@@ -154,8 +173,8 @@ def process_pdf_file_via_gemini(file_path: str) -> Dict[str, List[Dict[str, Any]
     try:
         uploaded_file = genai.upload_file(file_path, mime_type="application/pdf")
         
-        # Wait until file processing completes on Gemini's backend
-        for _ in range(30):
+        # Wait until file state is ACTIVE
+        for _ in range(40):
             file_info = genai.get_file(uploaded_file.name)
             state_name = getattr(file_info.state, "name", str(file_info.state))
             logger.info(f"Gemini file state: {state_name}")
@@ -235,7 +254,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "⚡ *AI Exam & PDF Quiz Engine*\n\n"
-        "📥 *Two Ways to Ingest Material:*\n"
+        "📥 *How to Ingest Material:*\n"
         "1. **Direct Upload**: Send any `.pdf` document up to 20 MB directly.\n"
         "2. **Google Drive Link (Any Size: 100MB+, 500MB, Full Books)**: Paste the Google Drive share link directly here!\n\n"
         "👉 _Send a PDF file or paste your Google Drive link to start!_",
@@ -306,7 +325,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⛔ Unauthorized.")
             return
 
-        status = await update.message.reply_text("⏳ *Step 1/3:* Fetching full document from Google Drive / Web...", parse_mode="Markdown")
+        status = await update.message.reply_text("⏳ *Step 1/3:* Downloading document from Google Drive...", parse_mode="Markdown")
         
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
             tmp_path = tmp_file.name
@@ -315,20 +334,20 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             success = await loop.run_in_executor(None, download_large_file, text, tmp_path)
             if not success or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1000:
-                raise Exception("Downloaded file is empty or link requires permission.")
+                raise Exception("Downloaded file is empty or permission denied.")
         except Exception as e:
-            logger.error(f"URL download failure: {e}")
+            logger.error(f"Download failure: {e}")
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             await status.edit_text(
-                f"❌ *Could not download from Google Drive:* `{e}`\n\n"
-                f"👉 Make sure Google Drive sharing is set to **'Anyone with the link'** (Viewer) and try pasting the link again.",
+                f"❌ *Download Failed:* `{e}`\n\n"
+                f"👉 Verify that Google Drive sharing is set to **'Anyone with the link'** (Viewer) and try again.",
                 parse_mode="Markdown"
             )
             return
 
         file_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
-        await status.edit_text(f"✅ *Document Downloaded:* `{file_size_mb:.1f} MB`\n⏳ *Step 2/3:* Uploading to Gemini AI & parsing Hindi/English chapters...", parse_mode="Markdown")
+        await status.edit_text(f"✅ *Downloaded:* `{file_size_mb:.1f} MB`\n⏳ *Step 2/3:* Uploading to Gemini AI & analyzing chapters...", parse_mode="Markdown")
         await process_and_prompt_topics(update, context, status, tmp_path)
 
 
@@ -349,7 +368,7 @@ async def process_and_prompt_topics(update: Update, context: ContextTypes.DEFAUL
                 pass
 
     if not grouped:
-        await status_msg.edit_text("❌ *No questions could be synthesized.* Ensure the PDF contains readable text/scans and try again.")
+        await status_msg.edit_text("❌ *No questions could be synthesized.* Ensure the PDF contains readable material and try again.")
         return
 
     ADMIN_STATE[user_id] = {
