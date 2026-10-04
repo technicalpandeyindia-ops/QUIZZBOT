@@ -832,6 +832,7 @@ async def run_native_quiz_polls(group_chat_id: int, context: ContextTypes.DEFAUL
         if correct_id < 0 or correct_id >= len(options):
             correct_id = 0
 
+        poll_msg = None
         try:
             poll_msg = await context.bot.send_poll(
                 chat_id=group_chat_id,
@@ -853,8 +854,49 @@ async def run_native_quiz_polls(group_chat_id: int, context: ContextTypes.DEFAUL
         except Exception as poll_err:
             logger.error(f"Poll send failed: {poll_err}")
 
-        # Wait 15s timer + 2s intermission before next question
-        await asyncio.sleep(17)
+        # 1. Wait for 15-second voting window to complete
+        await asyncio.sleep(15)
+
+        # 2. Automatically broadcast the Correct Answer & Detailed Solution Card
+        correct_text = options[correct_id] if correct_id < len(options) else "Correct Option"
+        full_solution = item.get("solution", "") or item.get("concept", "No additional notes.")
+        pro_tip = item.get("pro_tip", "")
+
+        # Build Option Breakdown with ✅ and ❌
+        opt_breakdown_lines = []
+        for o_i, o_text in enumerate(options):
+            if o_i == correct_id:
+                opt_breakdown_lines.append(f"✅ *{chr(65 + o_i)}) {o_text}* (CORRECT ANSWER)")
+            else:
+                opt_breakdown_lines.append(f"❌ *{chr(65 + o_i)}) {o_text}* (INCORRECT)")
+
+        opt_breakdown_str = "\n".join(opt_breakdown_lines)
+
+        solution_card = (
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 *ANSWER & SOLUTION (Q {idx + 1}/{total_q})*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{opt_breakdown_str}\n\n"
+            f"📝 *Detailed Explanation:*\n{full_solution}\n\n"
+        )
+        if pro_tip:
+            solution_card += f"💡 *Exam Trick & Key Rule:*\n`{pro_tip}`\n\n"
+
+        solution_card += f"⏳ _Next question starting in 5 seconds..._"
+
+        try:
+            reply_id = poll_msg.message_id if poll_msg else None
+            await context.bot.send_message(
+                chat_id=group_chat_id,
+                text=solution_card,
+                reply_to_message_id=reply_id,
+                parse_mode="Markdown"
+            )
+        except Exception as sol_err:
+            logger.error(f"Solution post failed: {sol_err}")
+
+        # 3. Brief intermission before next question
+        await asyncio.sleep(5)
 
     # ----------------- FINAL QUIZ SUMMARY -----------------
     scores = session.get("scores", {})
