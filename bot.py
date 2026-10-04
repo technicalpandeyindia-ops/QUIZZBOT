@@ -48,9 +48,6 @@ from telegram.ext import (
     filters,
 )
 
-# Global Poll ID to Session Mapping
-POLL_LOOKUP: Dict[str, Dict[str, Any]] = {}
-
 # ----------------- CONFIGURATION -----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -65,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 START_TIME = time.time()
 
-# Initialize Gemini Client (Supports both AQ... and AIzaSy... keys)
+# Initialize Gemini Client
 genai_client = None
 if GEMINI_API_KEY:
     if HAS_NEW_GENAI:
@@ -224,18 +221,16 @@ For each question provide:
 - "topic": Topic / Chapter Name (in Hindi or English as in the document)
 - "difficulty": "EASY" | "MEDIUM" | "HARD"
 - "q_type": "CONCEPTUAL" | "CURRENT-AFFAIRS" | "STATEMENT-BASED"
-- "question": High quality question text
-- "options": Array of exactly 4 options ["A", "B", "C", "D"]
+- "question": High quality question text (max 280 chars)
+- "options": Array of exactly 4 options ["A", "B", "C", "D"] (each max 90 chars)
 - "correct_index": Integer (0 for A, 1 for B, 2 for C, 3 for D)
 - "concept": Core fact or theoretical principle
 - "solution": In-depth step-by-step explanation
-- "option_breakdown": Detailed analysis of options
-- "pro_tip": Quick memory tip or key takeaway
+- "pro_tip": Quick memory tip or key takeaway (max 180 chars)
 
 Return ONLY a valid JSON array of objects.
 """
 
-    errors_log = []
     candidate_models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash-8b", "gemini-1.5-flash"]
 
     if genai_client:
@@ -283,11 +278,9 @@ Return ONLY a valid JSON array of objects.
                         return grouped, ""
                 except Exception as m_err:
                     logger.warning(f"Model {m_name} failed: {m_err}")
-                    errors_log.append(f"Model {m_name}: {m_err}")
 
         except Exception as e:
             logger.warning(f"Modern genai error: {e}")
-            errors_log.append(f"Modern SDK: {e}")
 
     # Method 2: Try legacy google.generativeai SDK
     if legacy_model:
@@ -313,7 +306,6 @@ Return ONLY a valid JSON array of objects.
                 return grouped, ""
         except Exception as e:
             logger.warning(f"Legacy genai error: {e}")
-            errors_log.append(f"Legacy SDK: {e}")
 
     # Method 3: Local Text Page Chunking Fallback
     try:
@@ -354,55 +346,38 @@ Return ONLY a valid JSON array of objects.
                     logger.warning(f"Fallback model {m_name} failed: {fb_m_err}")
     except Exception as e:
         logger.error(f"Fallback extraction error: {e}")
-        errors_log.append(f"Text Fallback: {e}")
 
-    detailed_err = "\n".join(errors_log) if errors_log else "Authentication failed."
-    return {}, detailed_err
+    return {}, "Could not synthesize questions from PDF. Check API key and format."
 
 
-# ----------------- TOPIC-BASED ZERO-DOCUMENT GENERATOR (UP SUPER TET PATTERN) -----------------
-def generate_custom_topic_mcqs(topic_name: str, count: int) -> Tuple[List[Dict[str, Any]], str]:
-    if not GEMINI_API_KEY:
-        return [], "GEMINI_API_KEY is not configured in Render environment."
-
-    count = max(5, min(count, 100))
-
+# ----------------- TOPIC-BASED ZERO-DOCUMENT GENERATOR (BATCHED) -----------------
+def generate_topic_batch(topic_name: str, batch_count: int, offset: int) -> List[Dict[str, Any]]:
     prompt = f"""
-You are an expert examiner specializing in the latest UP Super TET (उत्तर प्रदेश सुपर टीईटी) and state teacher recruitment / competitive exams.
-Analyze the latest official syllabus, standard exam trends, difficulty levels, and question formats for the topic: "{topic_name}".
+You are an expert exam paper creator for UP Super TET (उत्तर प्रदेश सुपर टीईटी) and state teacher recruitment examinations.
+Topic: "{topic_name}"
 
 CRITICAL SPECIFICATION:
-Generate EXACTLY {count} high-yield, exam-standard Multiple Choice Questions (MCQs) in Hindi (or bilingual if English subject) covering this topic thoroughly.
-
-Subject domains applicable:
-- Child Development & Pedagogy (बाल विकास एवं शिक्षण कौशल)
-- Hindi / Sanskrit / English Language & Grammar
-- Environmental & Social Studies (पर्यावरण एवं सामाजिक अध्ययन)
-- Science, Mathematics & Reasoning
-- General Knowledge & Current Affairs (सामान्य ज्ञान एवं समसामयिक घटनाएं)
-- Information Technology & Life Skills / Management Attitude (जीवन कौशल एवं प्रबंधन)
-
-For each question provide:
-- "question": High quality exam question text
-- "options": Array of exactly 4 options ["A", "B", "C", "D"]
+Generate EXACTLY {batch_count} unique Multiple Choice Questions (MCQs) starting from question offset #{offset + 1} in Hindi (or bilingual for English subject).
+Ensure questions and options are concise so they fit Telegram's strict limits:
+- "question": Max 280 characters
+- "options": Exactly 4 options, each MAX 90 characters
 - "correct_index": Integer (0 for A, 1 for B, 2 for C, 3 for D)
-- "concept": Core concept / rule
-- "solution": Detailed pedagogical step-by-step solution
-- "pro_tip": Exam trick, memory tip, or key article/rule
+- "concept": Core theoretical principle / rule
+- "solution": Clear step-by-step pedagogical explanation
+- "pro_tip": Important exam trick / memory shortcut (max 180 chars)
 
-Return ONLY a valid JSON array of {count} objects matching this schema:
+Return ONLY a valid JSON array of {batch_count} objects with this format:
 [
   {{
-    "question": "प्रश्न यहाँ लिखें...",
+    "question": "प्रश्न...",
     "options": ["विकल्प A", "विकल्प B", "विकल्प C", "विकल्प D"],
     "correct_index": 0,
     "concept": "मुख्य नियम",
     "solution": "विस्तृत व्याख्या",
-    "pro_tip": "याद रखने योग्य तथ्य"
+    "pro_tip": "याद रखने योग्य ट्रिक"
   }}
 ]
 """
-
     candidate_models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash-8b", "gemini-1.5-flash"]
     
     if genai_client:
@@ -421,18 +396,57 @@ Return ONLY a valid JSON array of {count} objects matching this schema:
                 )
                 data = clean_json_response(resp.text)
                 if isinstance(data, list) and len(data) > 0:
-                    return data, ""
+                    return data
             except Exception as e:
-                logger.warning(f"Topic generation model {m_name} failed: {e}")
+                logger.warning(f"Batch generation model {m_name} failed: {e}")
 
     if legacy_model:
         try:
             resp = legacy_model.generate_content(prompt)
             data = clean_json_response(resp.text)
             if isinstance(data, list) and len(data) > 0:
-                return data, ""
+                return data
         except Exception as e:
-            logger.warning(f"Legacy topic generation error: {e}")
+            logger.warning(f"Legacy batch topic generation error: {e}")
+
+    return []
+
+
+def generate_custom_topic_mcqs(topic_name: str, count: int) -> Tuple[List[Dict[str, Any]], str]:
+    if not GEMINI_API_KEY:
+        return [], "GEMINI_API_KEY is not configured in Render environment."
+
+    count = max(5, min(count, 100))
+    all_mcqs: List[Dict[str, Any]] = []
+    
+    batch_size = 20
+    remaining = count
+    offset = 0
+
+    while remaining > 0:
+        current_batch_size = min(remaining, batch_size)
+        logger.info(f"Generating batch of {current_batch_size} questions for '{topic_name}'...")
+        batch_mcqs = generate_topic_batch(topic_name, current_batch_size, offset)
+        
+        if batch_mcqs:
+            all_mcqs.extend(batch_mcqs)
+            offset += len(batch_mcqs)
+            remaining -= len(batch_mcqs)
+        else:
+            if current_batch_size > 10:
+                current_batch_size = 10
+                batch_mcqs = generate_topic_batch(topic_name, current_batch_size, offset)
+                if batch_mcqs:
+                    all_mcqs.extend(batch_mcqs)
+                    offset += len(batch_mcqs)
+                    remaining -= len(batch_mcqs)
+                else:
+                    break
+            else:
+                break
+
+    if all_mcqs:
+        return all_mcqs[:count], ""
 
     return [], "Could not synthesize questions for this topic. Verify API key and network."
 
@@ -441,7 +455,7 @@ Return ONLY a valid JSON array of {count} objects matching this schema:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if update.effective_chat.type != "private":
-        await update.message.reply_text("👋 Bot active. Admin commands run in private DM.")
+        await update.message.reply_text("👋 Bot active. Admin controls run in private DM.")
         return
 
     is_admin = (user_id == ADMIN_USER_ID or ADMIN_USER_ID == 0)
@@ -457,7 +471,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *AI Exam & Quiz Master (UP Super TET & All Exams)*\n\n"
         "Choose how you want to create your quiz:\n\n"
-        "1️⃣ *Create by Topic (No PDF)*: Just give the topic name (e.g. `UP Super TET - Bal Vikas`), select question count, and launch!\n"
+        "1️⃣ *Create by Topic (No PDF)*: Just give the topic name (e.g. `UP Super TET - Bal Vikas`), select question count (e.g. 25–50), and launch!\n"
         "2️⃣ *PDF / Cloud Ingest*: Send any PDF or Google Drive link for full book parsing.",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
@@ -604,12 +618,9 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏱️ *Timer:* `15s per question`\n"
                 f"✅ *Correct mark:* `+1.0`\n"
                 f"➖ *Negative:* `None`\n"
-                f"🔀 *Shuffle Q:* ❌ | *Options:* ❌\n"
-                f"💡 *Show explanation:* ✅ Yes\n"
-                f"🛡️ *Anti-Cheat:* ❌ Off\n"
-                f"📢 *Promo messages enabled*\n"
+                f"👥 *Voting:* `Open for ALL group members`\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🚀 *Starting now — good luck!*"
+                f"🚀 *Starting now — tap your answer on each poll!*"
             )
             await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
             group_chat_id = (await context.bot.get_chat(target_group)).id
@@ -623,11 +634,10 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
             "mcqs": mcqs,
             "current_index": 0,
-            "topic": topic,
-            "scores": {}
+            "topic": topic
         }
 
-        asyncio.create_task(run_native_quiz_polls(group_chat_id, context))
+        asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context))
         return
 
     # PDF Question Count Step
@@ -762,7 +772,6 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
     topic = state["selected_topic"]
     mcqs = state["topics_data"][topic]
     
-    # Apply requested question count if specified
     requested_count = state.get("pdf_q_count", len(mcqs))
     if requested_count < len(mcqs):
         mcqs = mcqs[:requested_count]
@@ -775,12 +784,9 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
             f"⏱️ *Timer:* `15s per question`\n"
             f"✅ *Correct mark:* `+1.0`\n"
             f"➖ *Negative:* `None`\n"
-            f"🔀 *Shuffle Q:* ❌ | *Options:* ❌\n"
-            f"💡 *Show explanation:* ✅ Yes\n"
-            f"🛡️ *Anti-Cheat:* ❌ Off\n"
-            f"📢 *Promo messages enabled*\n"
+            f"👥 *Voting:* `Open for ALL group members`\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🚀 *Starting now — good luck!*"
+            f"🚀 *Starting now — tap your answer on each poll!*"
         )
         await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
         group_chat_id = (await context.bot.get_chat(target_group)).id
@@ -794,15 +800,14 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
     ACTIVE_GROUP_QUIZZES[str(group_chat_id)] = {
         "mcqs": mcqs,
         "current_index": 0,
-        "topic": topic,
-        "scores": {}
+        "topic": topic
     }
 
-    asyncio.create_task(run_native_quiz_polls(group_chat_id, context))
+    asyncio.create_task(run_telegram_quiz_engine(group_chat_id, context))
 
 
-# ----------------- NATIVE TELEGRAM QUIZ POLL ENGINE -----------------
-async def run_native_quiz_polls(group_chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+# ----------------- TELEGRAM NATIVE QUIZ ENGINE (ALL-USER VOTING ENABLED) -----------------
+async def run_telegram_quiz_engine(group_chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     chat_key = str(group_chat_id)
     session = ACTIVE_GROUP_QUIZZES.get(chat_key)
     if not session:
@@ -814,61 +819,72 @@ async def run_native_quiz_polls(group_chat_id: int, context: ContextTypes.DEFAUL
     for idx, item in enumerate(mcqs):
         session["current_index"] = idx
 
-        # Format question: [1/76] Question text here
         raw_q = item.get("question", "").strip()
         q_title = f"[{idx + 1}/{total_q}] {raw_q}"
         if len(q_title) > 295:
             q_title = q_title[:292] + "..."
 
-        # Truncate options to Telegram 100 character limit
-        options = [str(opt)[:98] for opt in item.get("options", [])]
-
-        # Explanation (pops up via lightbulb 💡 icon on answer)
-        explanation = item.get("solution", "") or item.get("concept", "")
-        if len(explanation) > 195:
-            explanation = explanation[:192] + "..."
+        # Options (strictly max 98 characters per Telegram limit)
+        raw_options = item.get("options", [])
+        options = [str(opt).strip()[:95] for opt in raw_options if str(opt).strip()]
+        if len(options) < 2:
+            options = ["विकल्प A", "विकल्प B", "विकल्प C", "विकल्प D"]
 
         correct_id = int(item.get("correct_index", 0))
         if correct_id < 0 or correct_id >= len(options):
             correct_id = 0
 
+        # Explanation shown natively when user taps wrong or taps lightbulb 💡
+        explanation = item.get("pro_tip", "") or item.get("concept", "") or item.get("solution", "")
+        explanation = explanation.strip()
+        if len(explanation) > 195:
+            explanation = explanation[:192] + "..."
+
         poll_msg = None
         try:
+            # is_anonymous=True allows 100% of group members to vote without any permissions or privacy blocks
             poll_msg = await context.bot.send_poll(
                 chat_id=group_chat_id,
                 question=q_title,
                 options=options,
                 type="quiz",
                 correct_option_id=correct_id,
-                explanation=explanation,
-                is_anonymous=False,
-                open_period=15  # 15s visual countdown timer ring
+                explanation=explanation if explanation else None,
+                is_anonymous=True,
+                open_period=15  # 15s visual countdown ring
             )
-
-            # Store mapping for user score tracking
-            POLL_LOOKUP[poll_msg.poll.id] = {
-                "group_chat_id": group_chat_id,
-                "correct_option_id": correct_id
-            }
-
         except Exception as poll_err:
-            logger.error(f"Poll send failed: {poll_err}")
+            logger.error(f"Poll dispatch error: {poll_err}")
+            # Fallback if explanation had disallowed formatting
+            try:
+                poll_msg = await context.bot.send_poll(
+                    chat_id=group_chat_id,
+                    question=q_title,
+                    options=options,
+                    type="quiz",
+                    correct_option_id=correct_id,
+                    is_anonymous=True,
+                    open_period=15
+                )
+            except Exception as fb_err:
+                logger.error(f"Secondary poll fallback failed: {fb_err}")
 
-        # 1. Wait for 15-second voting window to complete
+        # 1. Wait for 15-second voting period to complete
         await asyncio.sleep(15)
 
-        # 2. Automatically broadcast the Correct Answer & Detailed Solution Card
-        correct_text = options[correct_id] if correct_id < len(options) else "Correct Option"
+        # 2. Post the Solution Card
         full_solution = item.get("solution", "") or item.get("concept", "No additional notes.")
         pro_tip = item.get("pro_tip", "")
+        correct_text = options[correct_id] if correct_id < len(options) else "Correct Option"
 
-        # Build Option Breakdown with ✅ and ❌
+        letters = ["A", "B", "C", "D"]
         opt_breakdown_lines = []
         for o_i, o_text in enumerate(options):
+            l_char = letters[o_i] if o_i < len(letters) else str(o_i + 1)
             if o_i == correct_id:
-                opt_breakdown_lines.append(f"✅ *{chr(65 + o_i)}) {o_text}* (CORRECT ANSWER)")
+                opt_breakdown_lines.append(f"✅ *{l_char}) {o_text}* (CORRECT ANSWER)")
             else:
-                opt_breakdown_lines.append(f"❌ *{chr(65 + o_i)}) {o_text}* (INCORRECT)")
+                opt_breakdown_lines.append(f"❌ *{l_char}) {o_text}* (INCORRECT)")
 
         opt_breakdown_str = "\n".join(opt_breakdown_lines)
 
@@ -882,7 +898,7 @@ async def run_native_quiz_polls(group_chat_id: int, context: ContextTypes.DEFAUL
         if pro_tip:
             solution_card += f"💡 *Exam Trick & Key Rule:*\n`{pro_tip}`\n\n"
 
-        solution_card += f"⏳ _Next question starting in 5 seconds..._"
+        solution_card += f"⏳ _Next question starting in 4 seconds..._"
 
         try:
             reply_id = poll_msg.message_id if poll_msg else None
@@ -893,62 +909,28 @@ async def run_native_quiz_polls(group_chat_id: int, context: ContextTypes.DEFAUL
                 parse_mode="Markdown"
             )
         except Exception as sol_err:
-            logger.error(f"Solution post failed: {sol_err}")
+            logger.error(f"Solution post error: {sol_err}")
 
-        # 3. Brief intermission before next question
-        await asyncio.sleep(5)
+        # 3. Intermission before next question
+        await asyncio.sleep(4)
 
-    # ----------------- FINAL QUIZ SUMMARY -----------------
-    scores = session.get("scores", {})
-    leaderboard_text = (
+    # ----------------- FINAL TEST COMPLETION -----------------
+    final_text = (
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 *TEST SUMMARY & LEADERBOARD*\n"
+        f"🏆 *TEST COMPLETED*\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"📖 *Topic:* `{session['topic']}`\n"
         f"📊 *Total Questions:* `{total_q}`\n\n"
+        f"🎉 *All questions answered! Check your individual poll scores in chat.*\n"
+        f"👉 To run another quiz on any topic or PDF, use `/start` in bot DM."
     )
-    if scores:
-        sorted_users = sorted(scores.values(), key=lambda x: x["correct"], reverse=True)
-        medals = ["🥇", "🥈", "🥉", "🎖️", "🎖️"]
-        for rank, u in enumerate(sorted_users[:10]):
-            badge = medals[rank] if rank < len(medals) else "👤"
-            pct = int((u["correct"] / total_q) * 100)
-            leaderboard_text += f"{badge} *{u['name']}*: `{u['correct']}/{total_q}` ({pct}%)\n"
-    else:
-        leaderboard_text += "_Session completed._\n"
-
-    leaderboard_text += "\n🎉 *Good job everyone! Upload new material in DM to run next quiz.*"
 
     await context.bot.send_message(
         chat_id=group_chat_id,
-        text=leaderboard_text,
+        text=final_text,
         parse_mode="Markdown"
     )
     ACTIVE_GROUP_QUIZZES.pop(chat_key, None)
-
-
-async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tracks live participant votes and scores from Native Quiz Polls."""
-    answer = update.poll_answer
-    poll_id = answer.poll_id
-    user = answer.user
-    selected = answer.option_ids[0] if answer.option_ids else -1
-
-    if poll_id in POLL_LOOKUP:
-        info = POLL_LOOKUP[poll_id]
-        chat_key = str(info["group_chat_id"])
-        session = ACTIVE_GROUP_QUIZZES.get(chat_key)
-        if session:
-            user_id = user.id
-            if user_id not in session["scores"]:
-                session["scores"][user_id] = {
-                    "name": user.first_name,
-                    "correct": 0,
-                    "total": 0
-                }
-            session["scores"][user_id]["total"] += 1
-            if selected == info["correct_option_id"]:
-                session["scores"][user_id]["correct"] += 1
 
 
 # ----------------- MAIN INITIALIZATION -----------------
@@ -980,9 +962,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_admin_text))
     app.add_handler(CallbackQueryHandler(handle_mode_callback, pattern=r"^mode_"))
     app.add_handler(CallbackQueryHandler(handle_admin_topic_choice, pattern=r"^adm_top:"))
-    app.add_handler(PollAnswerHandler(handle_poll_answer))
 
-    logger.info("Native QuizBot engine is active.")
+    logger.info("Native QuizBot engine active with full group voting enabled.")
     app.run_polling(drop_pending_updates=True, poll_interval=1.0, timeout=30)
 
 
