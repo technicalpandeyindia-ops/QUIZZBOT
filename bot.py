@@ -37,9 +37,13 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    PollAnswerHandler,
     ContextTypes,
     filters,
 )
+
+# Global Poll ID to Session Mapping
+POLL_LOOKUP: Dict[str, Dict[str, Any]] = {}
 
 # ----------------- CONFIGURATION -----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -111,19 +115,19 @@ def start_uptime_server():
 
 
 def start_self_pinger():
-    if not SELF_PING_URL:
-        return
+    # If SELF_PING_URL is a placeholder, fallback to local internal port
+    target = SELF_PING_URL.rstrip("/") + "/" if SELF_PING_URL and "your-app-name" not in SELF_PING_URL else f"http://127.0.0.1:{PORT}/"
+    logger.info(f"Keep-alive monitor targeting: {target}")
 
-    target = SELF_PING_URL.rstrip("/") + "/"
     while True:
         try:
             time.sleep(500)
             req = urllib.request.Request(target, headers={"User-Agent": "RenderSelfPinger/1.0"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status == 200:
-                    logger.info("Self-ping success.")
+                    logger.info("Keep-alive ping success (200 OK).")
         except Exception as e:
-            logger.warning(f"Self-ping failed: {e}")
+            logger.debug(f"Keep-alive ping debug: {e}")
 
 
 # ----------------- ROBUST GOOGLE DRIVE & WEB DOWNLOADER -----------------
@@ -541,17 +545,19 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
     try:
         intro_card = (
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🚀 *LIVE ARENA: LIVE MCQ TEST*\n"
+            f"📋 *Questions:* `{len(mcqs)}`\n"
+            f"⏱️ *Timer:* `15s per question`\n"
+            f"✅ *Correct mark:* `+1.0`\n"
+            f"➖ *Negative:* `None`\n"
+            f"🔀 *Shuffle Q:* ❌ | *Options:* ❌\n"
+            f"💡 *Show explanation:* ✅ Yes\n"
+            f"🛡️ *Anti-Cheat:* ❌ Off\n"
+            f"📢 *Promo messages enabled*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📖 *Topic:* `{topic}`\n"
-            f"📊 *Questions:* `{len(mcqs)}` (Full Chapter Session)\n"
-            f"⏱️ *Voting Timer:* 10 SECONDS per question\n"
-            f"💡 *Step-by-step solutions posted automatically*\n"
-            f"🏆 *Live Leaderboard at completion*\n\n"
-            f"👉 _First question incoming..._"
+            f"🚀 *Starting now — good luck!*"
         )
-        sent = await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
-        group_chat_id = sent.chat.id
+        await context.bot.send_message(chat_id=target_group, text=intro_card, parse_mode="Markdown")
+        group_chat_id = (await context.bot.get_chat(target_group)).id
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to reach `{target_group}`: `{e}`\nCheck bot admin permissions and try again:")
         return
@@ -563,15 +569,14 @@ async def handle_admin_group_input(update: Update, context: ContextTypes.DEFAULT
         "mcqs": mcqs,
         "current_index": 0,
         "topic": topic,
-        "scores": {},
-        "answered_users": set()
+        "scores": {}
     }
 
-    asyncio.create_task(run_modern_group_quiz(group_chat_id, context))
+    asyncio.create_task(run_native_quiz_polls(group_chat_id, context))
 
 
-# ----------------- GROUP QUIZ ENGINE -----------------
-async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+# ----------------- NATIVE TELEGRAM QUIZ POLL ENGINE -----------------
+async def run_native_quiz_polls(group_chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     chat_key = str(group_chat_id)
     session = ACTIVE_GROUP_QUIZZES.get(chat_key)
     if not session:
@@ -582,87 +587,50 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
 
     for idx, item in enumerate(mcqs):
         session["current_index"] = idx
-        session["answered_users"] = set()
 
-        diff = item.get("difficulty", "MEDIUM").upper()
-        q_type = item.get("q_type", "CONCEPTUAL").upper()
-        diff_badge = {"EASY": "🟢 EASY", "MEDIUM": "🟡 MEDIUM", "HARD": "🔴 ADVANCED"}.get(diff, "🟡 MEDIUM")
+        # Format question: [1/76] Question text here
+        raw_q = item.get("question", "").strip()
+        q_title = f"[{idx + 1}/{total_q}] {raw_q}"
+        if len(q_title) > 295:
+            q_title = q_title[:292] + "..."
 
-        progress_bar = "█" * (idx + 1) + "░" * (total_q - idx - 1)
-        q_card = (
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 *QUESTION {idx + 1}/{total_q}*  `[{progress_bar}]`\n"
-            f"🏷️ `[{diff_badge}]` • `[{q_type}]`\n"
-            f"⏱️ *Voting Window: 10 Seconds*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"*{item['question']}*\n\n"
-        )
-        for opt_idx, opt in enumerate(item["options"]):
-            letter = chr(65 + opt_idx)
-            q_card += f"*{letter})* {opt}\n"
+        # Truncate options to Telegram 100 character limit
+        options = [str(opt)[:98] for opt in item.get("options", [])]
 
-        buttons = []
-        row = []
-        for opt_idx in range(len(item["options"])):
-            letter = chr(65 + opt_idx)
-            cb = f"opt:{idx}:{opt_idx}"
-            row.append(InlineKeyboardButton(f"👉 Option {letter}", callback_data=cb))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
+        # Explanation (pops up via lightbulb 💡 icon on answer)
+        explanation = item.get("solution", "") or item.get("concept", "")
+        if len(explanation) > 195:
+            explanation = explanation[:192] + "..."
 
-        keyboard = InlineKeyboardMarkup(buttons)
-        question_message = await context.bot.send_message(
-            chat_id=group_chat_id,
-            text=q_card,
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
-
-        # 10-Second Voting Window
-        await asyncio.sleep(10)
-
-        correct_idx = item["correct_index"]
-        correct_letter = chr(65 + correct_idx)
-        correct_text = item["options"][correct_idx]
-
-        concept = item.get("concept", "")
-        solution = item.get("solution", "Step-by-step resolution.")
-        breakdown = item.get("option_breakdown", "")
-        pro_tip = item.get("pro_tip", "")
-
-        solution_card = (
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 *ANSWER KEY & DEEP ANALYSIS (Q{idx + 1})*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ *Correct Choice:* *{correct_letter}) {correct_text}*\n\n"
-        )
-        if concept:
-            solution_card += f"🧠 *Concept:* _{concept}_\n\n"
-        solution_card += f"🔬 *Explanation & Solution:*\n{solution}\n\n"
-        if breakdown:
-            solution_card += f"📊 *Option Elimination:*\n{breakdown}\n\n"
-        if pro_tip:
-            solution_card += f"💡 *Pro-Tip:*\n`{pro_tip}`\n\n"
-
-        solution_card += f"⏳ _Next question in 5 seconds..._"
+        correct_id = int(item.get("correct_index", 0))
+        if correct_id < 0 or correct_id >= len(options):
+            correct_id = 0
 
         try:
-            await context.bot.send_message(
+            poll_msg = await context.bot.send_poll(
                 chat_id=group_chat_id,
-                text=solution_card,
-                reply_to_message_id=question_message.message_id,
-                parse_mode="Markdown"
+                question=q_title,
+                options=options,
+                type="quiz",
+                correct_option_id=correct_id,
+                explanation=explanation,
+                is_anonymous=False,
+                open_period=15  # 15s visual countdown timer ring
             )
-            await question_message.edit_reply_markup(reply_markup=None)
-        except Exception as e:
-            logger.warning(f"Error publishing solution: {e}")
 
-        await asyncio.sleep(5)
+            # Store mapping for user score tracking
+            POLL_LOOKUP[poll_msg.poll.id] = {
+                "group_chat_id": group_chat_id,
+                "correct_option_id": correct_id
+            }
 
-    # Leaderboard Summary
+        except Exception as poll_err:
+            logger.error(f"Poll send failed: {poll_err}")
+
+        # Wait 15s timer + 2s intermission before next question
+        await asyncio.sleep(17)
+
+    # ----------------- FINAL QUIZ SUMMARY -----------------
     scores = session.get("scores", {})
     leaderboard_text = (
         f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -679,9 +647,9 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
             pct = int((u["correct"] / total_q) * 100)
             leaderboard_text += f"{badge} *{u['name']}*: `{u['correct']}/{total_q}` ({pct}%)\n"
     else:
-        leaderboard_text += "_No member votes recorded during this round._\n"
+        leaderboard_text += "_Session completed._\n"
 
-    leaderboard_text += "\n🎉 *Session concluded!*"
+    leaderboard_text += "\n🎉 *Good job everyone! Upload new material in DM to run next quiz.*"
 
     await context.bot.send_message(
         chat_id=group_chat_id,
@@ -691,51 +659,28 @@ async def run_modern_group_quiz(group_chat_id: int, context: ContextTypes.DEFAUL
     ACTIVE_GROUP_QUIZZES.pop(chat_key, None)
 
 
-async def handle_user_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-    data = query.data
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tracks live participant votes and scores from Native Quiz Polls."""
+    answer = update.poll_answer
+    poll_id = answer.poll_id
+    user = answer.user
+    selected = answer.option_ids[0] if answer.option_ids else -1
 
-    if not data.startswith("opt:"):
-        return
-
-    _, q_idx_str, opt_idx_str = data.split(":")
-    q_idx = int(q_idx_str)
-    opt_idx = int(opt_idx_str)
-
-    chat_key = str(update.effective_chat.id)
-    session = ACTIVE_GROUP_QUIZZES.get(chat_key)
-    if not session or session["current_index"] != q_idx:
-        await query.answer("⌛ Time is up for this question!", show_alert=True)
-        return
-
-    user_id = user.id
-    if user_id in session["answered_users"]:
-        await query.answer("⚠️ You have already answered this question!", show_alert=True)
-        return
-
-    session["answered_users"].add(user_id)
-
-    if user_id not in session["scores"]:
-        session["scores"][user_id] = {
-            "name": user.first_name,
-            "correct": 0,
-            "total": 0
-        }
-    session["scores"][user_id]["total"] += 1
-
-    item = session["mcqs"][q_idx]
-    correct_idx = item["correct_index"]
-
-    if opt_idx == correct_idx:
-        session["scores"][user_id]["correct"] += 1
-        score_now = session["scores"][user_id]["correct"]
-        feedback = f"🎯 RIGHT ANSWER, {user.first_name}! ✅\n({chr(65 + opt_idx)}) is correct!\nScore: {score_now} pts."
-    else:
-        correct_letter = chr(65 + correct_idx)
-        feedback = f"❌ WRONG, {user.first_name}!\nYou chose ({chr(65 + opt_idx)}).\nCorrect: ({correct_letter})."
-
-    await query.answer(text=feedback, show_alert=True)
+    if poll_id in POLL_LOOKUP:
+        info = POLL_LOOKUP[poll_id]
+        chat_key = str(info["group_chat_id"])
+        session = ACTIVE_GROUP_QUIZZES.get(chat_key)
+        if session:
+            user_id = user.id
+            if user_id not in session["scores"]:
+                session["scores"][user_id] = {
+                    "name": user.first_name,
+                    "correct": 0,
+                    "total": 0
+                }
+            session["scores"][user_id]["total"] += 1
+            if selected == info["correct_option_id"]:
+                session["scores"][user_id]["correct"] += 1
 
 
 # ----------------- MAIN INITIALIZATION -----------------
@@ -766,9 +711,9 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_admin_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_admin_text))
     app.add_handler(CallbackQueryHandler(handle_admin_topic_choice, pattern=r"^adm_top:"))
-    app.add_handler(CallbackQueryHandler(handle_user_selection, pattern=r"^opt:"))
+    app.add_handler(PollAnswerHandler(handle_poll_answer))
 
-    logger.info("Bot is active.")
+    logger.info("Native QuizBot engine is active.")
     app.run_polling(drop_pending_updates=True, poll_interval=1.0, timeout=30)
 
 
